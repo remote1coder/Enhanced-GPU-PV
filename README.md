@@ -296,14 +296,21 @@ service does not prove that a client is logged in or that streaming works.
 
 ## Verification status
 
-This revision is a static repair. The PowerShell sources pass PowerShell 5.1 parsing and
-isolated checks; the allocation update passed 65 parser and structure checks. Behavior
-suites are incomplete after an AMSI compilation crash, and nothing here certifies a real
-Hyper-V deployment, a guest installer, HDR, audio or remote login.
+The project has been exercised end to end on a real Hyper-V host. That covers the
+deployment and guest installation path actually used; it does not automatically extend to
+every entrypoint, option or streaming combination, so treat an untried combination as
+unverified.
 
-Treat the first run on real hardware as an acceptance test on a disposable VM: record host
-and guest builds, GPU driver version, package versions and disk identity, then verify the
-client login, picture, audio, HDR and RDP behavior from another machine.
+The PowerShell sources also pass PowerShell 5.1 parsing and isolated checks, and the
+allocation update passed 65 parser and structure checks. The automated behavior suites
+remain incomplete after an AMSI compilation crash; they are regression evidence, not a
+substitute for a host run.
+
+Client-side acceptance is still a separate manual step. A completed installation does not
+by itself prove that a client can log in, that picture and audio work, that requested HDR
+is applied or that RDP is reachable from another machine. Re-check those after changing GPU
+drivers or package versions, and record the host and guest builds, GPU driver version,
+package versions and disk identity when you do.
 
 ## License
 

@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# Enhanced-GPU-PV repository hygiene
+# Only README.md is published among Markdown documents.
+# ---------------------------------------------------------------------------
+
+# Local Markdown notes and working documents stay out of the repository.
+*.md
+!README.md
+
+# Installer packages, archives and disk images are download artifacts.
+*.7z
+*.exe
+*.msi
+*.zip
+*.iso
+*.vhd
+*.vhdx
+
+# Local download cache and scratch directories.
+Downloads/
+temp/
+.vscode/
+
+# Unrelated scratch files (Locale-Emulator ml.h analysis).
+scan.ps1
+scan2.ps1
+scan3.ps1
+scan4.ps1
+scan5.ps1
+scan.cs
+anon_struct_lines.txt

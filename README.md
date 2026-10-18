@@ -1,133 +1,85 @@
-<p align="center">
-  <h1 align="center">Enhanced-GPU-PV</h1>
-  <p align="center">
-    A project dedicated to making
-    <br />
-    GPU Paravirtualization on Windows Hyper-V easier!
-    <br />
-    Now with Sunshine and Virtual Display Driver support!
-  </p>
-</p>
+# Enhanced-GPU-PV
 
-<br>
+Windows PowerShell automation for Hyper-V GPU partitioning, virtual displays, Parsec or Sunshine and optional virtual audio. Based on Easy-GPU-PV; GPL v3.
 
-## ℹ About
+This revision was checked with PowerShell 5.1 parsing and isolated tests. It has not been run against Hyper-V, a guest installer or a streaming client during this repair. The repair workstation must not be used for these operations.
 
-This project is based on the "Easy-GPU-PV" project and tries to improve on it.
+## Current paths
 
->GPU-PV allows you to partition your systems dedicated or integrated GPU and assign it to several Hyper-V VMs. It's the same technology that is used in WSL2, and Windows Sandbox.  
-Easy-GPU-PV aims to make this easier by automating the steps required to get a GPU-PV VM up and running.  
-Easy-GPU-PV does the following...  
->1) Creates a VM of your choosing.
->2) Automatically Installs Windows to the VM.
->3) Partitions your GPU of choice and copies the required driver files to the VM.  
->4) Installs [Parsec](https://parsec.app) to the VM. Parsec is an ultra low latency remote desktop app, use this to connect to the VM.  You can use Parsec for free non commercially. To use Parsec commercially, sign up to a [Parsec For Teams](https://parsec.app/teams) account.
+| Entry | Behavior |
+|---|---|
+| CopyFilesToVM.ps1 | New VM from ISO with sources/install.wim, or direct WIM; HostDownload only; ESD-only media is rejected |
+| Configure-GpuPV-ExistingVM.ps1 | Full existing-VM configuration, explicit resume/restart/rerun |
+| Configure-GpuPV-ExistingVM-SecureNote.ps1 | Thin wrapper around the same core |
+| Enhanced-GPU-PV.ps1 | Menu; option 5 runs full ExistingVM configuration; option 9 changes GPU quotas only |
+| Set-GpuPVAllocation.ps1 | Quota-only change on an already Off VM with one existing adapter; no driver/deployment work |
+| Update-VMGpuPartitionDriver.ps1 | Driver refresh through the identity-bound offline target |
+| VMScripts/PostBoot-Installer.ps1 | Shared guest installer and independent VerifyOnly checks |
+| VMScripts/Activate-VDD.ps1 | Manual VDD activation without forced restart |
 
-The original project only allowed the user to set up Parsec and no alternative like Sunshine/Moonlight.   Furthermore it only added a virtual display to the VM when the user connected to it by relying on the fallback display of the Parsec App and its Privacy Mode.   
-This could lead to some [issues](https://github.com/jamesstringerparsec/Easy-GPU-PV/issues/190) and also meant that the screen was disconnected when no user was connected, causing problems for some people including me ;-). When connecting to the VM you were also logged out.  
-This updated version lets the user choose if he wants to install Sunshine or Parsec. It also adds a permanently connected virtual display to the VM, resolving the aforementioned issues. The user can also decide between two different Virtual Display solutions.  
-One [solution](https://github.com/timminator/ParsecVDA-Always-Connected) is based on the Parsec Virtual Display Driver. The other [solution](https://github.com/timminator/Virtual-Display-Driver) utilizes the Virtual Display Driver by [itsmikethetech](https://github.com/itsmikethetech) that i modified so that it can be installed remotely in this project.  
-Both solutions allow high resolutions and high refresh rates.  
+Archive-Original and the old User/VMScripts guest-download scripts remain executable historical source. They are not repaired supported entrypoints and must not be launched as a fallback. Templates may be under User/User; they were not moved. SecureNote is not an antivirus exemption. Do not disable antivirus or expand exclusions to make a rejected action proceed.
 
+## GPU allocation inputs
 
-A summary of the most important changes compared to the original project:
-* Allows the user to install Sunshine or Parsec
-* Adds a permanently connected virtual display to the VM without relying on the Parsec App
-* The user can choose between to different virtual display solutions
+GPU allocation defaults to 50 percent across supported entrypoints and the internal helper. Interactive prompts accept `70` or `70%`, retry invalid input, and use 50 only for blank input. Entering `4GiB` sets VRAM bytes and then asks compute, encode and decode percentages separately. Menu option 9 changes quotas on an existing adapter without rerunning deployment; the VM must already be Off. Read [GPU_ALLOCATION.md](GPU_ALLOCATION.md) for CLI arguments, exact state encoding, resume behavior and verification limits.
 
-Minor changes:
-* The installation also disables the OneDrive autostart. It caused problems due to setting up a local account and not a Microsoft account.
-* Adds language and timezone to the configurable parameters of the installation.
-* The installation sets the time for turning off the display to "Never". 
+The allocation update passed 65 PowerShell 5.1 parser/structure checks. Behavior suites remain pending after a PowerShell AMSI compilation crash; this is not runtime acceptance. Its audit is E:\codex\_gpu_allocation_20261015. Earlier test totals below belong to earlier source revisions.
 
+## Choices and packages
 
-## Prerequisites:
+StreamingChoice: None, Parsec+ParsecVDA, Parsec+VDD, Sunshine+ParsecVDA or Sunshine+VDD. AudioDriver: None, VBCable or VirtualAudioDriver. Sunshine+ParsecVDA does not install the Parsec streaming app. Current VDD configuration supports one monitor.
 
-* Windows 10 20H1+ Pro, Enterprise or Education OR Windows 11 Pro, Enterprise or Education.  Windows 11 on host and VM is preferred due to better compatibility.  
-* Matched Windows versions between the host and VM. Mismatches may cause compatibility issues, blue-screens, or other issues. (Win10 21H2 + Win10 21H2, or Win11 21H2 + Win11 21H2, for example).  
-* Desktop Computer with dedicated NVIDIA/AMD GPU or Integrated Intel GPU - Laptops with NVIDIA GPUs are not supported at this time, but Intel integrated GPUs work on laptops.  GPU must support hardware video encoding (NVIDIA NVENC, Intel Quicksync or AMD AMF).  
-* Latest GPU driver from Intel.com, NVIDIA.com or AMD.com, don't rely on device manager or Windows update.  
-* Latest Windows 10/11 ISO can be [downloaded from here](https://www.microsoft.com/en-gb/software-download/windows10ISO) and  [from here.](https://www.microsoft.com/en-us/software-download/windows11) - Do not use Media Creation Tool, if no direct ISO link is available, follow [this guide.](https://www.nextofwindows.com/downloading-windows-10-iso-images-using-rufus)
-* Virtualization need to be enabled in the motherboard and [Hyper-V needs to be fully enabled](https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/quick-start/enable-hyper-v) on the Windows 10/ 11 OS (requires reboot).  
-* Allow Powershell scripts to run on your system - typically by running "Set-ExecutionPolicy unrestricted" in Powershell running as Administrator.
-* On first boot of the VM an internet connection is required for installing Parsec, the Virtual Display and the audio driver.
+Every active path prepares packages on the host, checks hashes, copies them into a checked guest volume, and verifies the exact manifest again inside the guest. VMDownload is rejected. Configure Parsec accounts/Teams and Sunshine first-run accounts manually in their applications; automatic Teams enrollment is unsupported. A running service does not prove login or streaming.
 
+| Package | Pinned version | Hash source |
+|---|---|---|
+| Sunshine | v2026.914.233613, MSI | GitHub release asset digest |
+| VDD / Virtual Audio Driver | 25.7.23 | GitHub release asset digest |
+| NefCon | v1.17.40 | GitHub release asset digest |
+| Parsec | 150.104.1.0 | Microsoft WinGet manifest |
+| VC++ x64 runtime | 14.51.36247.0 | Microsoft WinGet manifest |
+| ParsecVDA Always Connected | v1.4.1 | Direct HTTPS release bytes measured on 2026-10-12 |
+| VB-Cable | Pack43 | Direct HTTPS vendor bytes measured on 2026-10-12 |
 
-## Steps to get it running:
+InstallerPolicy.json records the exact sources and hashes. The last two are locally computed hashes of upstream downloads, not independently published checksums or malware-free guarantees. Pack43 is retained to avoid an untested installer upgrade; VB-Audio also publishes Pack45. Parsec uses a mutable vendor URL: an upstream replacement will fail the pinned hash check. Review and update the policy deliberately instead of disabling verification. No downloaded program was executed during this audit.
 
-1. Make sure your system meets the prerequisites.
-2. Download the latest release and extract it.
-3. Search your system for Powershell ISE and run it as Administrator.
-4. In the extracted folder you downloaded, open PreChecks.ps1 in Powershell ISE and run it by using the green play button and copy the GPU listed (or the warnings that you need to fix).
-5. Open CopyFilesToVM.ps1 in Powershell ISE and edit the params section at the top of the file. Further notes regarding these parameters you can find down below.
-6. Run CopyFilesToVM.ps1 with your changes to the params section - this may take 5-10 minutes.
-7. Open and sign into Parsec or Sunshine on the VM. If you're using Sunshine also pair your VM with a client.
-8. After that double click the shortcut "Switch Display to ParsecVDA/Virtual Display" depending on your chosen solution. Your mouse inside the VM will disappear. Close the window on the host. Use Parsec or Moonlight to connect to the VM.
+## Recovery
 
-You should be good to go!
+State schema 2 binds an entrypoint and target. ExistingVM uses the exact VM name and GUID. NewVM determines the name before state lookup and records the GUID after creation. A different VM reusing a name is rejected. ExistingVM now also persists the selected VHD, disk, partition and volume identity before offline mutation. A saved Phase 3 or later without that binding is rejected: preserve the old state and explicitly ResetState on a suitable host. ResetState restarts the workflow; it is not a rollback. Legacy state may contain secrets; it is neither silently loaded nor deleted.
 
-## Notes:
+- Resume continues pending phases and reacquires runtime credentials/readiness.
+- ResetState uses current configuration; it does not undo previous VM changes.
+- ExistingVM StartFromStep accepts 1–7; 0 means normal resume. Rerunning invalidates the chosen phase and its downstream phases, and requires earlier successful phases.
+- NewVM StartFromStep accepts Phase1–Phase7. A partially created VM is not automatically deleted or adopted; inspect it on an authorized host before recovering.
+- Failed installation, missing components and restart-required results leave completion pending. A restart is an explicit operator action on an authorized host.
+- Completion state is retained. Manual client acceptance remains separate.
 
-- If you're using the Sunshine/Moonlight solution I would advice you to do a restart of the VM after your first connection via Moonlight.  
-For some reason on the first switch to the Virtual Display the refresh rate is not hitting the set limit. For example on a 60hz refresh rate its limited to 56 fps instead and can be verified by a website like testufo.com. This causes dropped frames. After a restart the problem never occurs again.
-- Connections to the VM can take up to 60 seconds. This can cause problems when using the default moonlight client, as it has a timeout window of 10 seconds. If no frame is received in this timeframe the connection attempt times out. This can lead to needing several attempts to successfully connect to the VM via Moonlight.  
-To solve this problem, i also created a new Moonlight build that increases this timeout to 60 seconds instead. You can check it out [here](https://github.com/timminator/Moonlight-Tailored-for-GPU-PV).
+State uses a non-secret allowlist, explicit UTF-8 decoding, typed configuration validation and atomic writes. NewVM completed phases must form a contiguous prefix with the VM GUID present after creation. The source autounattend.xml is preserved; a temporary host copy is deleted in finally. Windows setup still needs a provisioning credential in the guest answer file; manage that account and guest setup artifacts appropriately. No automatic transcript is enabled.
 
-## Upgrading GPU Drivers after updating the host GPU Drivers:
+## Storage, switches and RDP
 
-It's important to update the VM GPU drivers after you have updated the Host GPUs drivers. You can do this by...  
-1. Shut down your VM and reboot the host after updating GPU drivers.  
-2. Open Powershell as administrator and change the directory (CD) to the path where CopyFilesToVM.ps1 and Update-VMGpuPartitionDriver.ps1 are located. 
-3. Run ```Update-VMGpuPartitionDriver.ps1 -VMName "Name of your VM" -GPUName "Name of your GPU"```    (Windows 10 GPU name must be "AUTO")
+Multiple attached disks require an explicit SystemVhdPath; multiple candidate Windows partitions require SystemPartitionNumber. VM/VHD/disk/partition/volume identities are checked together. Missing access paths, host volumes, identity changes and reparse traversal are rejected. Disk identity is checked again before releasing an owned mount. If a successful mount cannot be identified, it is left for manual inspection rather than detached by a guessed disk number. Driver functions require that checked target rather than a drive letter. Saved/paused VMs are refused for offline driver changes; shutdown is graceful. TimeoutSeconds limits follow-up polling, not the synchronous Stop-VM call itself.
 
+SkipCleanup still stages required installers. SkipGpuDriverUpdate suppresses GPU-driver cleanup/copy, not every VM setting. ExistingVM Auto disables RDP connections; KeepRdp enables the checked rule for the configured port. NewVM display policy does not itself certify RDP connection policy. Menu option 6 reports local listener/rule observations; remote login is unverified.
 
-## Values:
+## Later real-host acceptance
 
-Some more infos about the Parameters needed to be set in CopyFilesToVM.ps1:
+Use Windows PowerShell 5.1 and an appropriate Windows/Hyper-V installation, compatible GPU drivers, administrator access and a recoverable disposable test VM. This repair does not certify hardware/OS combinations. PreChecks runs real host queries and is not an isolated test.
 
-  * ```VMName = "GPUP"``` - Name of VM in Hyper-V and the computername / hostname  
-  * ```SourcePath = "C:\Users\james\Downloads\Win11_English_x64.iso"``` - path to Windows 10/ 11 ISO on your host   
-  * ```Edition    = 6``` - Leave as 6, this means Windows 10/11 Pro  
-  * ```VhdFormat  = "VHDX"``` - Leave this value alone  
-  * ```DiskLayout = "UEFI"``` - Leave this value alone  
-  * ```SizeBytes  = 40GB``` - Disk size, in this case 40GB, the minimum is 20GB  
-  * ```MemoryAmount = 8GB``` - Memory size, in this case 8GB  
-  * ```CPUCores = 4``` - CPU cores you want to assign to the VM, in this case 4   
-  * ```NetworkSwitch = "Default Switch"``` - Create a new external network switch beforehand in Hyper-V Manager. A tutorial you can find [here](https://www.youtube.com/watch?v=XLLcc29EZ_8&t=707s).   
-  * ```VHDPath = "C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\"``` - Path to the folder you want the VM disk to be stored in, it must already exist, currently set to default path in Windows 11  
-  * ```UnattendPath = "$PSScriptRoot"+"\autounattend.xml"``` -Leave this value alone  
-  * ```GPUName = "AUTO"``` - AUTO selects the first available GPU. On Windows 11 you may also use the exact name of the GPU you want to share with the VM in multi GPU situations (GPU selection is not available in Windows 10 and must be set to AUTO)    
-  * ```GPUResourceAllocationPercentage = 50``` - Percentage of the GPU you want to share with the VM
-  * ```Parsec = $true``` - Decide if you want to install Parsec or not
-  * ```ParsecVDA = $true``` - Decide if you want to install the Parsec Virtual Display sol. or not
-  * ```Sunshine = $true``` - Decide if you want to install Sunshine or not
-  * ```VirtualDisplayDriver = $true``` - Decide if you want to install the Virtual Display Driver sol. or not
-  * ```Team_ID = ""``` - The Parsec for Teams ID if you are a Parsec for Teams Subscriber  
-  * ```Key = ""``` - The Parsec for Teams Secret Key if you are a Parsec for Teams Subscriber  
-  * ```Username = "GPUVM"``` - The VM Windows Username, do not include special characters, and must be different from the "VMName" value you set  
-  * ```Password = "CoolestPassword!"``` - The VM Windows Password, cannot be blank    
-  * ```Autologon = "true"``` - If you want the VM to automatically login to the Windows Desktop  
-  * ```Language = ""``` - Only affects keyboard layout and other minor settings, language is predetermined by the specified ISO. If you want to use the default settings by your ISO leave this parameter empty like this: ""  
-  * ```Timezone = ""``` - If you want to use the default settings by your ISO leave this parameter empty like this: ""
+On an authorized suitable host, record host/guest builds, GPU/driver, packages and disk identity; exercise normal installation, controlled resume and fresh verification. Test actual client login, picture, audio, requested HDR and RDP behavior from another machine. Keep failure injection isolated; do not force power loss or kill installers for testing.
 
+ExistingVM PlanOnly/WhatIf emits a plan, not a host inspection. Here only its pure functions and AST ordering were tested; the entrypoint was not run.
 
-## Further Notes:  
+See REPAIR_NOTES_20261015.md for the second static repair, evidence and remaining acceptance. REPAIR_NOTES_20261012.md retains the first-round GPU-01 through GPU-15 mapping. Current audit scripts, evidence and backups are under E:\codex\_gpu_repair_20261013; first-round evidence remains under E:\codex\_gpu_repair_20261011. Old CHANGES/EVOLUTION files are historical and may conflict with this revision.
 
-- After you have signed into Parsec or Sunshine on the VM, always use Parsec or Moonlight to connect to the VM.
-- You can also set all four parameters regarding Parsec, Sunshine and virtual display solutions to false and just create a VM with GPU-PV support if this is what you need.
-- If you get the message "ERROR  : Cannot bind argument to parameter 'Path' because it is null." : This probably means you used Media Creation Tool to download the ISO.  You unfortunately cannot use that, if you don't see a direct ISO download link at the Microsoft page, follow [this guide.](https://www.nextofwindows.com/downloading-windows-10-iso-images-using-rufus)  
-- Your GPU on the host will have a Microsoft driver in device manager, rather than an nvidia/intel/amd driver. As long as it doesn't have a yellow triangle on top of the device in device manager, it's working correctly.  
-- A powered on display / HDMI dummy dongle must be plugged into the GPU to allow Parsec to capture the screen. You only need one of these per host machine regardless of number of VM's. You can also use the same [Virtual Display Driver](https://github.com/timminator/ParsecVDA-Always-Connected) used in this enhanced version. I would appreciate it if you check it out. This allows your host to run headless aswell.
-- If your computer is super fast it may get to the login screen before the audio driver (VB Cable) and Parsec display driver are installed, but fear not! They should soon install. The installation is finished when the shortcut "Switch Display to ParsecVDA" is displayed on your desktop.  
-- The screen may go black for times up to 60 seconds in situations when UAC prompts appear, applications go in and out of fullscreen and when you switch between video codecs in Parsec - not really sure why this happens, it's unique to GPU-P machines and seems to recover faster at 1280x720.
-- Vulkan renderer is unavailable and GL games may or may not work.  [This](https://www.microsoft.com/en-us/p/opencl-and-opengl-compatibility-pack/9nqpsl29bfff?SilentAuth=1&wa=wsignin1.0#activetab=pivot:overviewtab) may help with some OpenGL apps.  
-- If you do not have administrator permissions on the machine it means you set the username and vmname to the same thing, these needs to be different.  
-- AMD Polaris GPUS like the RX 580 do not support hardware video encoding via GPU Paravirtualization at this time.  
-- To download Windows ISOs with Rufus, it must have "Check for updates" enabled.
-- The minimum OS version changed to Windows 10 21H2 Pro, due to the usage of newest Parsec virtual display driver.
+## Second static repair notes
 
+Conversion errors and failed cleanup stop the workflow. A pre-existing final VHD is never deleted or replaced. ISO mounts are released only by their owner. Failed/unknown WIM or hive cleanup leaves a diagnostic path for inspection; do not recursively delete that path while it may still be mounted. Partial VM creation remains an explicit recovery task.
 
-## Acknowledgements of the main project:  
+Archive layouts are tied to the pinned versions in InstallerPolicy.json. NefCon, VDD, Virtual Audio and VB-Cable use exact archive members instead of the first matching filename. The VDD package named x86 actually declares NTamd64 in its INF; its filename alone does not select a 32-bit driver. VDD uses the pinned 25.7.23 XML format and one explicitly selected or uniquely healthy guest GPU. A conflicting VDD registry override is reported, not overwritten. Virtual Audio 25.7.23 requires guest build 22000 or later; this pinned VDD's HDR mode requires build 22631 or later. These are package/source checks, not proof of working audio or HDR.
 
-- [Hyper-ConvertImage](https://github.com/tabs-not-spaces/Hyper-ConvertImage) for creating an updated version of [Convert-WindowsImage](https://github.com/MicrosoftDocs/Virtualization-Documentation/tree/master/hyperv-tools/Convert-WindowsImage) that is compatible with Windows 10 and 11.
-- [gawainXX](https://github.com/gawainXX) for help testing and pointing out bugs and feature improvements. 
+Sunshine rules are program-scoped TCP/UDP rules matching the pinned publisher setup. Verification reads the effective firewall rules and filters. Existing conflicting project rules stop verification; unrelated rules and administrator execution policy are preserved. Existing installations may have legacy broad rules; this repair does not identify those rules as owned merely by their display names.
+
+A required restart is recorded under the guest installer directory and must be resolved before completion. Keep those records when restaging packages. Unknown/interrupted installer state needs inspection; it must not be erased merely to obtain a green result. See the repair notes for recovery details.
+
+Before the allocation update, the second round was a static candidate with incomplete regression: 323 checks passed, while 227 checks remain pending (77 NewVM, 37 reboot-journal, and 113 prior PostBoot checks needing current-revision rerun). Several test processes crashed inside AMSI during compilation. The 12 supported PowerShell source files passed PowerShell 5.1 parsing. See REPAIR_NOTES_20261015.md and final_validation.json; this is not real deployment acceptance.

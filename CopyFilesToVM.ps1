@@ -1,4 +1,80 @@
-﻿$params = @{
+﻿[CmdletBinding()]
+param(
+    [switch]$Interactive,
+    [ValidateSet("", "Phase1", "Phase2", "Phase3", "Phase4", "Phase5", "Phase6", "Phase7")]
+    [string]$StartFromStep = "",
+    [string]$TargetVMName = "",
+    [switch]$ResetState,
+    [string]$GPUAllocation,
+    [string]$GPUComputePercentage,
+    [string]$GPUEncodePercentage,
+    [string]$GPUDecodePercentage
+)
+
+# Do not record a successful phase after a nonterminating provisioning error.
+$ErrorActionPreference = 'Stop'
+
+# ============================================================================
+# Global Config Structure for Interactive Mode / 交互模式全局配置结构
+# ============================================================================
+$script:Config = @{
+    VMName = "GPUPV"
+    SourcePath = $null
+    VHDPath = $null
+    Edition = 6
+    VhdFormat = "VHDX"
+    DiskLayout = "UEFI"
+    SizeBytes = 40GB
+    MemoryAmount = 8GB
+    CPUCores = 4
+    NetworkSwitch = "Default Switch"
+    GPUName = "AUTO"
+    GPUResourceAllocationPercentage = 50
+    GPUAllocationPolicy = $null # Optional canonical policy; null uses the legacy percentage.
+    StreamingChoice = $null
+    SecurityModel = "HostDownload"
+    SunshineStreamConfig = @{
+        Preset = "Default"
+        Resolution = "3840x2160"
+        FPS = "120"
+        HEVCMode = "0"
+        AV1Mode = "0"
+        HDRMode = "disabled"
+        Bitrate = "50000"
+    }
+    VDDConfig = @{
+        Resolution = "3840x2160"
+        RefreshRate = "120"
+        HDR = $false
+    }
+    ConnectionMethod = "Auto"
+    AudioDriver = "VBCable"
+    Username = "GPUVM"
+    Password = $null
+    Autologon = "true"
+    Language = ""
+    Timezone = ""
+    Team_ID = ""
+    Key = ""
+    InstallFilePaths = @{
+        SunshineInstaller = $null
+        VDDZip = $null
+        ParsecInstaller = $null
+        ParsecVDAInstaller = $null
+        VBCableZip = $null
+        VirtualAudioDriverZip = $null
+        NefConZip = $null
+        VCRedist = $null
+    }
+    PhaseCompleted = @()
+}
+
+# ============================================================================
+# Backward-compatible params hashtable / 向后兼容的 params 哈希表
+# ============================================================================
+# When -Interactive is NOT used, this serves as the configuration source.
+# 当不使用 -Interactive 时，此哈希表作为配置来源。
+$params = @{
     VMName = "GPUPV"
     SourcePath = "C:\Users\james\Downloads\Win11_English_x64.iso"
     Edition    = 6
@@ -13,6 +89,7 @@
     UnattendPath = "$PSScriptRoot"+"\autounattend.xml"
     GPUName = "AUTO"
     GPUResourceAllocationPercentage = 50
+    GPUAllocationPolicy = $null # Optional canonical policy; null uses the legacy percentage.
 
     # Valid combinations are: 
     # 1. All four false (just a machine with GPU-PV support) 
@@ -25,10 +102,19 @@
     Sunshine = $false
     VirtualDisplayDriver = $false
 
+    # Optional: provide local installer files to avoid downloading from the internet / 可选：提供本地安装文件以避免从互联网下载
+    LocalParsecPath = ""
+    LocalSunshinePath = ""
+    LocalVBCableZipPath = ""
+    LocalVirtualAudioDriverPath = ""
+    LocalParsecVDAPath = ""
+    LocalVirtualDisplayDriverPath = ""
+    LocalVirtualDisplayDriverHDRPath = ""
+
     Team_ID = ""
     Key = ""
     Username = "GPUVM"
-    Password = "CoolestPassword!"
+    Password = $null
     Autologon = "true"
     # Only affects keyboard layout and other minor settings, language is predetermined by the specified ISO
     # If you want to use the default settings by your ISO leave this parameter empty like this: ""  
@@ -39,82 +125,614 @@
     Timezone = ""
 }
 
-Import-Module $PSSCriptRoot\Add-VMGpuPartitionAdapterFiles.psm1
+Import-Module (Join-Path $PSScriptRoot 'GpuPV-Allocation.psm1') -ErrorAction Stop
+Import-Module $PSScriptRoot\Add-VMGpuPartitionAdapterFiles.psm1
+Import-Module $PSScriptRoot\Enhanced-GPU-PV-Common.psm1
+Import-Module (Join-Path $PSScriptRoot "GpuPV-Workflow.psm1") -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot "GpuPV-TargetSafety.psm1") -ErrorAction Stop
 
-Function Is-Administrator {  
-    $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent();
-    (New-Object Security.Principal.WindowsPrincipal $CurrentUser).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)  
+# Resolve explicit allocation text without querying the host. Prompt only when it is absent.
+$script:RequestedGpuAllocationPolicy = $null
+$allocationArgs = @{}
+foreach ($pair in @(@('GPUAllocation','Allocation'),@('GPUComputePercentage','ComputePercentage'),@('GPUEncodePercentage','EncodePercentage'),@('GPUDecodePercentage','DecodePercentage'))) {
+    if ($PSBoundParameters.ContainsKey($pair[0])) { $allocationArgs[$pair[1]] = $PSBoundParameters[$pair[0]] }
+}
+if ($allocationArgs.Count -gt 0) { $script:RequestedGpuAllocationPolicy = New-GpuPVAllocationPolicy @allocationArgs }
+
+function Set-NewVmAllocationPolicy {
+    if ($null -eq $script:Config.GPUAllocationPolicy) {
+        $script:Config.GPUAllocationPolicy = ConvertTo-GpuPVAllocationPolicy -Policy @{Mode='Percent';Percentage=$script:Config.GPUResourceAllocationPercentage}
+    } else { $script:Config.GPUAllocationPolicy = ConvertTo-GpuPVAllocationPolicy -Policy $script:Config.GPUAllocationPolicy }
+    $script:Config.GPUResourceAllocationPercentage = if ($script:Config.GPUAllocationPolicy.Mode -eq 'Percent') { $script:Config.GPUAllocationPolicy.Percentage } else { [decimal]50 }
 }
 
-Function Dismount-ISO {
-param (
-[string]$SourcePath
-)
-    $disk = Get-Volume | Where-Object {$_.DriveType -eq "CD-ROM"} | select *
-    foreach ($d in $disk) {
-        Dismount-DiskImage -ImagePath $sourcePath | Out-Null
+# ============================================================================
+# Interactive Configuration Wizard Functions / 交互式配置向导函数
+# ============================================================================
+
+Function Invoke-ConfigWizard {
+<#
+.SYNOPSIS
+    Run the interactive configuration wizard and populate $script:Config.
+    运行交互式配置向导并填充 $script:Config。
+#>
+    [CmdletBinding()]
+    param([string]$KnownVMName)
+    Clear-Host
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "Enhanced-GPU-PV VM Creation Wizard" -ForegroundColor Cyan
+    Write-Host "Enhanced-GPU-PV 虚拟机创建向导" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "This wizard will guide you through creating a GPU-PV VM." -ForegroundColor Yellow
+    Write-Host "本向导将引导您完成 GPU-PV 虚拟机的创建。" -ForegroundColor Yellow
+    Write-Host ""
+
+    # Step 1: VM Basic Info
+    Write-StepHeader -StepNumber "1" -EnTitle "VM Basic Information" -ZhTitle "虚拟机基本信息"
+    $script:Config.VMName = $KnownVMName
+    if (-not $KnownVMName) { $script:Config.VMName = Read-Host "VM Name / 虚拟机名称 (default: GPUVM)" }
+    if ([string]::IsNullOrWhiteSpace($script:Config.VMName)) { $script:Config.VMName = "GPUVM" }
+    $script:Config.SourcePath = Read-Host "ISO Path / ISO 路径"
+    $script:Config.VHDPath = Read-Host "VHD Directory / VHD 目录 (default: C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\)"
+    if ([string]::IsNullOrWhiteSpace($script:Config.VHDPath)) { $script:Config.VHDPath = "C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\" }
+    $memInput = Read-Host "Memory (GB) / 内存(GB) (default: 8)"
+    if ([string]::IsNullOrWhiteSpace($memInput)) { $memInput = "8" }
+    try { $memVal = [int64]$memInput } catch { Write-Warning "Invalid memory '$memInput', using 8. / 无效内存 '$memInput'，使用 8。"; $memVal = 8 }
+    if ($memVal -lt 1) { $memVal = 8 }
+    $script:Config.MemoryAmount = $memVal * 1GB
+    $cpuInput = Read-Host "CPU Cores / CPU 核心数 (default: 4)"
+    if ([string]::IsNullOrWhiteSpace($cpuInput)) { $cpuInput = "4" }
+    try { $cpuVal = [int]$cpuInput } catch { Write-Warning "Invalid CPU '$cpuInput', using 4. / 无效 CPU '$cpuInput'，使用 4。"; $cpuVal = 4 }
+    if ($cpuVal -lt 1) { $cpuVal = 4 }
+    $script:Config.CPUCores = $cpuVal
+    $diskInput = Read-Host "Disk Size (GB) / 磁盘大小(GB) (default: 40)"
+    if ([string]::IsNullOrWhiteSpace($diskInput)) { $diskInput = "40" }
+    try { $diskVal = [int64]$diskInput } catch { Write-Warning "Invalid disk '$diskInput', using 40. / 无效磁盘 '$diskInput'，使用 40。"; $diskVal = 40 }
+    if ($diskVal -lt 20) { $diskVal = 40 }
+    $script:Config.SizeBytes = $diskVal * 1GB
+    $script:Config.NetworkSwitch = Read-Host "Network Switch / 网络交换机 (default: Default Switch)"
+    if ([string]::IsNullOrWhiteSpace($script:Config.NetworkSwitch)) { $script:Config.NetworkSwitch = "Default Switch" }
+
+    # Step 2: GPU Config
+    Write-StepHeader -StepNumber "2" -EnTitle "GPU Configuration" -ZhTitle "GPU 配置"
+    Write-Host "Detecting GPUs... / 正在检测 GPU..." -ForegroundColor Yellow
+    $gpus = Get-WmiObject Win32_VideoController | Where-Object { $_.Name -notmatch "Basic|Remote|Virtual|Hyper-V" }
+    if ($gpus) {
+        Write-Host "Available GPUs / 可用 GPU:" -ForegroundColor Green
+        for ($i = 0; $i -lt $gpus.Count; $i++) {
+            Write-Host "  [$i] $($gpus[$i].Name)"
+        }
+        Write-Host "  [A] AUTO (let script choose)"
+        $gpuChoice = Read-Host "Select GPU / 选择 GPU (0-$($gpus.Count-1) or A)"
+        if ($gpuChoice -eq "A" -or $gpuChoice -eq "a") {
+            $script:Config.GPUName = "AUTO"
+        } elseif ($gpuChoice -match "^\d+$" -and [int]$gpuChoice -lt $gpus.Count) {
+            $script:Config.GPUName = $gpus[[int]$gpuChoice].Name
+        } else {
+            $script:Config.GPUName = "AUTO"
+        }
+    } else {
+        $script:Config.GPUName = "AUTO"
     }
-}
+    # Windows 10 must use AUTO (specific GPU selection is Win11+ only) / Windows 10 必须用 AUTO（指定 GPU 仅 Win11+ 支持）
+    try {
+        $osBuild = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).CurrentBuild
+        if ([int]$osBuild -lt 22000) { $script:Config.GPUName = "AUTO" }
+    } catch { }
+    $script:Config.GPUAllocationPolicy = if ($null -ne $script:RequestedGpuAllocationPolicy) { $script:RequestedGpuAllocationPolicy } else { Read-GpuPVAllocationPolicy }
+    Set-NewVmAllocationPolicy
+    Write-Host (Format-GpuPVAllocationPolicy -Policy $script:Config.GPUAllocationPolicy)
 
-Function Mount-ISOReliable {
-param (
-[string]$SourcePath
-)
-    $mountResult = Mount-DiskImage -ImagePath $SourcePath
-    $delay = 0
-    Do {
-        if ($delay -gt 15) {
-            Function Get-NewDriveLetter {
-                $UsedDriveLetters = ((Get-Volume).DriveLetter) -join ""
-                 Do {
-                    $DriveLetter = (65..90)| Get-Random | % {[char]$_}
-                    }
-                Until (!$UsedDriveLetters.Contains("$DriveLetter"))
-                $DriveLetter
-                }
-            $DriveLetter = "$(Get-NewDriveLetter)" +  ":"
-            Get-WmiObject -Class Win32_volume | Where-Object {$_.Label -eq "CCCOMA_X64FRE_EN-US_DV9"} | Set-WmiInstance -Arguments @{DriveLetter="$driveletter"}
+    # Step 3: Streaming Choice
+    Write-StepHeader -StepNumber "3" -EnTitle "Streaming Software" -ZhTitle "串流软件"
+    Write-Host "[1] Parsec + ParsecVDA"
+    Write-Host "[2] Parsec + Virtual Display Driver"
+    Write-Host "[3] Sunshine + ParsecVDA"
+    Write-Host "[4] Sunshine + Virtual Display Driver"
+    Write-Host "[5] Just GPU-PV (no streaming software)"
+    $streamChoice = Read-Host "Choice / 选择 (1-5)"
+    switch ($streamChoice) {
+        "1" { $script:Config.StreamingChoice = "Parsec+ParsecVDA" }
+        "2" { $script:Config.StreamingChoice = "Parsec+VDD" }
+        "3" { $script:Config.StreamingChoice = "Sunshine+ParsecVDA" }
+        "4" { $script:Config.StreamingChoice = "Sunshine+VDD" }
+        default { $script:Config.StreamingChoice = "None" }
+    }
+
+    # Packages are prepared and verified on the host for every supported path.
+    Write-StepHeader -StepNumber "4" -EnTitle "Installer preparation" -ZhTitle "安装包准备"
+    Write-Host "HostDownload: pinned packages are checked on host and guest. / 宿主与来宾均核验安装包。"
+    Write-Host "Legacy VMDownload templates are retained for reference and are not used. / 旧模板仅保留参考。"
+    $script:Config.SecurityModel = "HostDownload"
+
+    # Step 4.5: Audio Driver / 音频驱动
+    Write-StepHeader -StepNumber "4.5" -EnTitle "Audio Driver" -ZhTitle "音频驱动"
+    Write-Host "[1] VB-Audio Virtual Cable (Default, Mature)" -ForegroundColor Green
+    Write-Host "    默认选项，成熟稳定。"
+    Write-Host "[2] Virtual Audio Driver by VirtualDrivers (+Virtual Mic)" -ForegroundColor Cyan
+    Write-Host "    VirtualDrivers 官方虚拟音频驱动，附带虚拟麦克风。"
+    Write-Host "[3] None / Do not install audio driver" -ForegroundColor Yellow
+    Write-Host "    不安装音频驱动。"
+    $audioChoice = Read-Host "Choice / 选择 (1-3, default: 1)"
+    switch ($audioChoice) {
+        "2" { $script:Config.AudioDriver = "VirtualAudioDriver" }
+        "3" { $script:Config.AudioDriver = "None" }
+        default { $script:Config.AudioDriver = "VBCable" }
+    }
+
+    # Step 5: Sunshine Advanced Config (if Sunshine selected)
+    if ($script:Config.StreamingChoice -match "Sunshine") {
+        Write-StepHeader -StepNumber "5" -EnTitle "Sunshine Advanced Configuration" -ZhTitle "Sunshine 高级配置"
+        Write-Host "[1] Default - Balanced settings"
+        Write-Host "[2] Performance - Low latency, medium quality"
+        Write-Host "[3] Quality - High quality, higher latency"
+        Write-Host "[4] Custom - Configure manually"
+        $sunPreset = Read-Host "Preset / 预设 (1-4)"
+        # Reset AV1Mode so non-Custom presets don't inherit a stale value from a previous run / 重置 AV1Mode，避免非 Custom 预设继承上次运行的残留值
+        $script:Config.SunshineStreamConfig.AV1Mode = "0"
+        switch ($sunPreset) {
+            "2" {
+                $script:Config.SunshineStreamConfig.Preset = "Performance"
+                $script:Config.SunshineStreamConfig.Resolution = "1920x1080"
+                $script:Config.SunshineStreamConfig.FPS = "120"
+                $script:Config.SunshineStreamConfig.HEVCMode = "0"
+                $script:Config.SunshineStreamConfig.HDRMode = "disabled"
+                $script:Config.SunshineStreamConfig.Bitrate = "20000"
             }
-        Start-Sleep -s 1 
-        $delay++
+            "3" {
+                $script:Config.SunshineStreamConfig.Preset = "Quality"
+                $script:Config.SunshineStreamConfig.Resolution = "3840x2160"
+                $script:Config.SunshineStreamConfig.FPS = "60"
+                $script:Config.SunshineStreamConfig.HEVCMode = "0"
+                $script:Config.SunshineStreamConfig.HDRMode = "disabled"
+                $script:Config.SunshineStreamConfig.Bitrate = "80000"
+            }
+            "4" {
+                $script:Config.SunshineStreamConfig.Preset = "Custom"
+                $script:Config.SunshineStreamConfig.Resolution = Read-Host "Resolution / 分辨率 (e.g. 3840x2160)"
+                if ([string]::IsNullOrWhiteSpace($script:Config.SunshineStreamConfig.Resolution)) { $script:Config.SunshineStreamConfig.Resolution = "3840x2160" }
+                $script:Config.SunshineStreamConfig.FPS = Read-Host "FPS / 帧率 (default: 120)"
+                if ([string]::IsNullOrWhiteSpace($script:Config.SunshineStreamConfig.FPS)) { $script:Config.SunshineStreamConfig.FPS = "120" }
+                $script:Config.SunshineStreamConfig.HEVCMode = Read-Host "HEVC Mode (0=auto, 1=disabled, 2=Main, 3=Main10, default: 0)"
+                if ([string]::IsNullOrWhiteSpace($script:Config.SunshineStreamConfig.HEVCMode)) { $script:Config.SunshineStreamConfig.HEVCMode = "0" }
+                $script:Config.SunshineStreamConfig.AV1Mode = Read-Host "AV1 Mode (0=auto, 1=disabled, 2=Main8, 3=Main10, default: 0)"
+                if ([string]::IsNullOrWhiteSpace($script:Config.SunshineStreamConfig.AV1Mode)) { $script:Config.SunshineStreamConfig.AV1Mode = "0" }
+                $script:Config.SunshineStreamConfig.HDRMode = Read-Host "HDR Mode (disabled or auto, default: disabled)"
+                if ([string]::IsNullOrWhiteSpace($script:Config.SunshineStreamConfig.HDRMode)) { $script:Config.SunshineStreamConfig.HDRMode = "disabled" }
+                $script:Config.SunshineStreamConfig.Bitrate = Read-Host "Bitrate (kbps, default: 50000)"
+                if ([string]::IsNullOrWhiteSpace($script:Config.SunshineStreamConfig.Bitrate)) { $script:Config.SunshineStreamConfig.Bitrate = "50000" }
+            }
+            default {
+                $script:Config.SunshineStreamConfig.Preset = "Default"
+                $script:Config.SunshineStreamConfig.Resolution = "1920x1080"
+                $script:Config.SunshineStreamConfig.FPS = "60"
+                $script:Config.SunshineStreamConfig.HEVCMode = "0"
+                $script:Config.SunshineStreamConfig.HDRMode = "disabled"
+                $script:Config.SunshineStreamConfig.Bitrate = "20000"
+            }
         }
-    Until (($mountResult | Get-Volume).DriveLetter -ne $NULL)
-    ($mountResult | Get-Volume).DriveLetter
-}
 
-Function ConcatenateVHDPath {
-param(
-[string]$VHDPath,
-[string]$VMName
-)
-    if ($VHDPath[-1] -eq '\') {
-        $VHDPath + $VMName + ".vhdx"
-        }
-    else {
-        $VHDPath + "\" +  $VMName + ".vhdx"
-        }
-}
+    }
 
-Function SmartExit {
-param (
-[switch]$NoHalt,
-[string]$ExitReason
-)
-    if (($host.name -eq 'Windows PowerShell ISE Host') -or ($host.Name -eq 'Visual Studio Code Host')) {
-        Write-Host $ExitReason
-        Exit
-        }
-    else{
-        if ($NoHalt) {
-            Write-Host $ExitReason
-            Exit
-        }
-        else {
-            Write-Host $ExitReason
-            Read-host -Prompt "Press any key to Exit..."
-            Exit
+    # Step 6: VDD Config (if VDD selected, regardless of Sunshine) / 第 6 步: VDD 配置（只要选了 VDD，不限 Sunshine）
+    if ($script:Config.StreamingChoice -match "VDD") {
+        Write-StepHeader -StepNumber "6" -EnTitle "Virtual Display Driver Configuration" -ZhTitle "虚拟显示驱动器配置"
+        $vddRes = Read-Host "Resolution / 分辨率 (default: 3840x2160)"
+        if ([string]::IsNullOrWhiteSpace($vddRes)) { $vddRes = "3840x2160" }
+        $script:Config.VDDConfig.Resolution = $vddRes
+        $vddHz = Read-Host "Refresh Rate / 刷新率 (default: 120)"
+        if ([string]::IsNullOrWhiteSpace($vddHz)) { $vddHz = "120" }
+        $script:Config.VDDConfig.RefreshRate = $vddHz
+    }
+
+    # Step 7: Connection Method (if Sunshine or VDD) / 第 7 步: 连接方式（Sunshine 或 VDD）
+    if ($script:Config.StreamingChoice -match "Sunshine|VDD") {
+        Write-StepHeader -StepNumber "7" -EnTitle "Connection Method" -ZhTitle "连接方式"
+        Write-Host "[1] Auto - Disable RDP virtual adapters, pair Sunshine via browser" -ForegroundColor Green
+        Write-Host "    Auto 模式 - 禁用 RDP 虚拟适配器，通过浏览器配对 Sunshine"
+        Write-Host "[2] KeepRDP - Keep RDP available, place VDD activation script on Desktop" -ForegroundColor Yellow
+        Write-Host "    KeepRDP 模式 - 保留 RDP，桌面放置 VDD 激活脚本"
+        $connChoice = Read-Host "Choice / 选择 (1-2)"
+        if ($connChoice -eq "2") {
+            $script:Config.ConnectionMethod = "KeepRdp"
+        } else {
+            $script:Config.ConnectionMethod = "Auto"
         }
     }
+
+    # Step 8: Account Info
+    Write-StepHeader -StepNumber "8" -EnTitle "Account Information" -ZhTitle "账户信息"
+    $script:Config.Username = Read-Host "Username / 用户名 (default: GPUVM)"
+    if ([string]::IsNullOrWhiteSpace($script:Config.Username)) { $script:Config.Username = "GPUVM" }
+    $pwInput = Read-GpuPVSecret -Prompt "Windows password (required; not saved in checkpoint)"
+    if ([string]::IsNullOrWhiteSpace($pwInput)) { throw "A nonempty Windows password is required." }
+    $script:Config.Password = $pwInput
+    # Parsec Teams credentials (optional, only for Parsec) / Parsec Teams 凭据（可选，仅 Parsec）
+    if ((Get-GpuPVStreamingPlan $script:Config.StreamingChoice).Parsec) {
+        $script:Config.Team_ID = Read-Host "Parsec Team ID (leave empty if not a Teams subscriber) / Parsec 团队 ID（非 Teams 订阅留空）"
+        $script:Config.Key = Read-GpuPVSecret -Prompt "Parsec Team Key (optional; automatic Teams enrollment is not supported)"
+    }
+    $script:Config.Language = Read-Host "Language / 语言 (e.g. en-US, zh-CN, leave empty for default)"
+    $script:Config.Timezone = Read-Host "Timezone / 时区 (leave empty for default)"
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "Configuration Complete! / 配置完成！" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "Press Enter to begin VM creation... / 按回车键开始创建虚拟机..."
+    Read-Host
+}
+
+Function Sync-ConfigToParams {
+<#
+.SYNOPSIS
+    Map $script:Config values back to $params for backward compatibility.
+    将 $script:Config 的值映射回 $params 以保持向后兼容。
+#>
+    [CmdletBinding()]
+    param()
+    Set-NewVmAllocationPolicy
+    $params.GPUAllocationPolicy = $script:Config.GPUAllocationPolicy
+    $params.VMName = $script:Config.VMName
+    $params.SourcePath = $script:Config.SourcePath
+    $params.VHDPath = $script:Config.VHDPath
+    $params.Edition = $script:Config.Edition
+    $params.VhdFormat = $script:Config.VhdFormat
+    $params.DiskLayout = $script:Config.DiskLayout
+    $params.SizeBytes = $script:Config.SizeBytes
+    $params.MemoryAmount = $script:Config.MemoryAmount
+    $params.CPUCores = $script:Config.CPUCores
+    $params.NetworkSwitch = $script:Config.NetworkSwitch
+    $params.GPUName = $script:Config.GPUName
+    $params.GPUResourceAllocationPercentage = $script:Config.GPUResourceAllocationPercentage
+    $params.Username = $script:Config.Username
+    $params.Password = $script:Config.Password
+    $params.Autologon = $script:Config.Autologon
+    $params.Language = $script:Config.Language
+    $params.Timezone = $script:Config.Timezone
+    $params.Team_ID = $script:Config.Team_ID
+    $params.Key = $script:Config.Key
+
+    # Map streaming choice to boolean flags / 将串流选择映射为布尔标志
+    $sc = $script:Config.StreamingChoice
+    $params.Parsec = ($sc -eq "Parsec+ParsecVDA" -or $sc -eq "Parsec+VDD")
+    $params.ParsecVDA = ($sc -eq "Parsec+ParsecVDA" -or $sc -eq "Sunshine+ParsecVDA")
+    $params.Sunshine = ($sc -eq "Sunshine+ParsecVDA" -or $sc -eq "Sunshine+VDD")
+    $params.VirtualDisplayDriver = ($sc -eq "Parsec+VDD" -or $sc -eq "Sunshine+VDD")
+
+    # Map local installer paths / 映射本地安装文件路径
+    $ifps = $script:Config.InstallFilePaths
+    if ($ifps.SunshineInstaller) { $params.LocalSunshinePath = $ifps.SunshineInstaller }
+    if ($ifps.ParsecInstaller) { $params.LocalParsecPath = $ifps.ParsecInstaller }
+    if ($ifps.ParsecVDAInstaller) { $params.LocalParsecVDAPath = $ifps.ParsecVDAInstaller }
+    if ($ifps.VBCableZip) { $params.LocalVBCableZipPath = $ifps.VBCableZip }
+    if ($ifps.VirtualAudioDriverZip) { $params.LocalVirtualAudioDriverPath = $ifps.VirtualAudioDriverZip }
+    if ($ifps.VDDZip) { $params.LocalVirtualDisplayDriverPath = $ifps.VDDZip }
+    # VDD HDR variant removed - VirtualDrivers official version uses single ZIP / VDD HDR 变体已移除 - VirtualDrivers 官方版本使用单一 ZIP
+}
+
+# ============================================================================
+# Host File Preparation / 宿主机文件准备
+# ============================================================================
+
+Function Invoke-HostFilePreparation {
+<#
+.SYNOPSIS
+    Download all required installer files on the host for HostDownload mode.
+    在宿主机下载 HostDownload 模式所需的所有安装文件。
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Config
+    )
+    $downloadDir = Join-Path $PSScriptRoot "Downloads"
+    if (-not (Test-Path $downloadDir)) {
+        New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+    }
+
+    $sc = $Config.StreamingChoice
+    $plan = Get-GpuPVStreamingPlan -Choice $sc
+    Write-StepHeader -StepNumber "2-H" -EnTitle "Host File Preparation" -ZhTitle "宿主机文件准备"
+
+    # Sunshine installer / Sunshine 安装程序
+    if ($plan.Sunshine) {
+        $dest = Join-Path $downloadDir (Get-GpuPVInstallerPolicy -DisplayName "Sunshine").FileName
+        Invoke-DownloadWithCache -Url "https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.exe" -DestinationPath $dest -DisplayName "Sunshine"
+        $Config.InstallFilePaths.SunshineInstaller = $dest
+    }
+
+    # VDD / 虚拟显示驱动器 (VirtualDrivers official / VirtualDrivers 官方版本)
+    if ($plan.VDD) {
+        $dest = Join-Path $downloadDir "VirtualDisplayDriver-x86.Driver.Only.zip"
+        Invoke-DownloadWithCache -Url "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/latest/download/VirtualDisplayDriver-x86.Driver.Only.zip" -DestinationPath $dest -DisplayName "VDD" -FallbackFileNames @("vdd-driver.zip")
+        $Config.InstallFilePaths.VDDZip = $dest
+    }
+
+    # Parsec / Parsec
+    if ($plan.Parsec) {
+        $dest = Join-Path $downloadDir "parsec-windows.exe"
+        Invoke-DownloadWithCache -Url "https://builds.parsecgaming.com/package/parsec-windows.exe" -DestinationPath $dest -DisplayName "Parsec"
+        $Config.InstallFilePaths.ParsecInstaller = $dest
+    }
+
+    # ParsecVDA / ParsecVDA
+    if ($plan.ParsecVDA) {
+        $dest = Join-Path $downloadDir "ParsecVDA.-.Always.Connected-v1.4.1-setup-x64.exe"
+        Invoke-DownloadWithCache -Url "https://github.com/timminator/ParsecVDA-Always-Connected/releases/download/v1.4.1/ParsecVDA.-.Always.Connected-v1.4.1-setup-x64.exe" -DestinationPath $dest -DisplayName "ParsecVDA"
+        $Config.InstallFilePaths.ParsecVDAInstaller = $dest
+    }
+
+    # Audio Driver / 音频驱动
+    switch ($Config.AudioDriver) {
+        "VirtualAudioDriver" {
+            $dest = Join-Path $downloadDir "VirtualAudioDriver.zip"
+            Invoke-DownloadWithCache -Url "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/latest/download/VirtualAudioDriver-x86.Driver.Only.zip" -DestinationPath $dest -DisplayName "Virtual Audio Driver" -FallbackFileNames @("VirtualAudioDriver-x86.Driver.Only.zip")
+            $Config.InstallFilePaths.VirtualAudioDriverZip = $dest
+        }
+        "VBCable" {
+            $dest = Join-Path $downloadDir "VBCable.zip"
+            Invoke-DownloadWithCache -Url "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -DestinationPath $dest -DisplayName "VB-Cable"
+            $Config.InstallFilePaths.VBCableZip = $dest
+        }
+        "None" { }
+        default { throw "Unknown audio driver choice." }
+    }
+
+    # NefCon (required for VDD installation) / NefCon（VDD 安装必需）
+    if ($plan.VDD -or $Config.AudioDriver -eq "VirtualAudioDriver") {
+        $dest = Join-Path $downloadDir "nefcon_v1.17.40.zip"
+        Invoke-DownloadWithCache -Url "https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip" -DestinationPath $dest -DisplayName "NefCon" -FallbackFileNames @("nefcon.zip")
+        $Config.InstallFilePaths.NefConZip = $dest
+        # Extract now so we can reference the x64 exe later / 现在解压以便后续引用 x64 版本
+        $nefconExtractDir = Join-Path $downloadDir "NefCon"
+        # Guest extraction uses the verified ZIP and a fresh per-run directory.
+    }
+
+    # VC++ Redistributable / VC++ 运行库
+    $dest = Join-Path $downloadDir "vc_redist.x64.exe"
+    Invoke-DownloadWithCache -Url "https://aka.ms/vs/17/release/vc_redist.x64.exe" -DestinationPath $dest -DisplayName "VC++ Redist"
+    $Config.InstallFilePaths.VCRedist = $dest
+
+    Write-Bilingual -En "All files prepared in $downloadDir" -Zh "所有文件已准备到 $downloadDir"
+}
+
+Function Copy-InstallerFilesToVHDX {
+    param([Parameter(Mandatory=$true)]$Target,[Parameter(Mandatory=$true)][hashtable]$Config)
+    Assert-GpuPVTarget -Target $Target
+    $progData = Assert-GpuPVTargetPath -Target $Target -Path ($Target.Root + 'ProgramData\Easy-GPU-P')
+    $installersDir = Assert-GpuPVTargetPath -Target $Target -Path (Join-Path $progData 'Installers')
+    New-Item -ItemType Directory -Path $installersDir -Force -ErrorAction Stop | Out-Null
+    $componentMap = @{SunshineInstaller=@('Sunshine','Sunshine');VDDZip=@('VDD','VDD');ParsecInstaller=@('Parsec','Parsec');ParsecVDAInstaller=@('ParsecVDA','ParsecVDA');VBCableZip=@('VBCable','VB-Cable');VirtualAudioDriverZip=@('VirtualAudioDriver','Virtual Audio Driver');NefConZip=@('NefCon','NefCon');VCRedist=@('VCRedist','VC++ Redist')}
+    $files = @{}
+    foreach ($key in $Config.InstallFilePaths.Keys) {
+        $source = $Config.InstallFilePaths[$key]
+        if (-not $source) { continue }
+        if (-not $componentMap.ContainsKey($key)) { throw 'Unknown staged installer component.' }
+        $component,$displayName = $componentMap[$key]
+        $policy = Get-GpuPVInstallerPolicy -DisplayName $displayName
+        Assert-GpuPVArtifact -Path $source -ExpectedSha256 $policy.Sha256 -ExpectedSize $policy.Size
+        $destination = Assert-GpuPVTargetPath -Target $Target -Path (Join-Path $installersDir $policy.FileName)
+        Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
+        Assert-GpuPVArtifact -Path $destination -ExpectedSha256 $policy.Sha256 -ExpectedSize $policy.Size
+        $files[$component] = @{FileName=$policy.FileName;Sha256=$policy.Sha256;Size=(Get-Item -LiteralPath $destination -ErrorAction Stop).Length;Version=$policy.Version}
+    }
+    foreach ($name in @('PostBoot-Installer.ps1','Activate-VDD.ps1')) {
+        $source = Join-Path (Join-Path $PSScriptRoot 'VMScripts') $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required guest helper is missing: $name" }
+        $destination = Assert-GpuPVTargetPath -Target $Target -Path (Join-Path $progData $name)
+        Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
+    }
+    foreach ($name in @('Parsec.lnk','SwitchDisplayParsecVDA.vbs','ParsecVDA.ico','Switch Display to ParsecVDA.bat')) {
+        $source = Join-Path (Join-Path $PSScriptRoot 'VMScripts') $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            $destination = Assert-GpuPVTargetPath -Target $Target -Path (Join-Path $progData $name)
+            Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
+        }
+    }
+    $guestConfig = @{InstallerFiles=$files;StreamingChoice=$Config.StreamingChoice;ConnectionMethod=$Config.ConnectionMethod;SecurityModel=$Config.SecurityModel;AudioDriver=$Config.AudioDriver;SunshineStreamConfig=$Config.SunshineStreamConfig;VDDConfig=$Config.VDDConfig;ParsecConfig=@{}}
+    $configPath = Assert-GpuPVTargetPath -Target $Target -Path (Join-Path $installersDir 'config.json')
+    Write-GpuPVJsonAtomic -Path $configPath -Value $guestConfig
+}
+
+# Reacquire by immutable identity at every phase, never by a reusable display name.
+function Resolve-NewVmIdentity {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$VMName, [Parameter(Mandatory=$true)][string]$VMId)
+    $id = [guid]::Empty
+    if (-not [guid]::TryParse($VMId, [ref]$id) -or $id -eq [guid]::Empty) { throw 'A valid saved target VM identity is required.' }
+    $targets = @(Get-VM -Id $id -ErrorAction Stop)
+    if ($targets.Count -ne 1 -or [string]$targets[0].VMId -ine [string]$id -or [string]$targets[0].Name -cne $VMName) {
+        throw 'Target VM identity/name no longer matches this task; no replacement VM will be adopted.'
+    }
+    return $targets[0]
+}
+
+function Start-NewVmTarget {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$VMName, [Parameter(Mandatory=$true)][string]$VMId)
+    $target = Resolve-NewVmIdentity -VMName $VMName -VMId $VMId
+    if ([string]$target.State -eq 'Running') { return }
+    if ([string]$target.State -ne 'Off') { throw 'VM must be Off or Running; inspect its current state before resuming.' }
+    Start-VM -VM $target -ErrorAction Stop
+}
+
+Function Invoke-Phase5_WaitForVM {
+<#
+.SYNOPSIS
+    Wait for the VM to finish first boot and become reachable via PowerShell Direct.
+    等待 VM 完成首次启动并通过 PowerShell Direct 可达。
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$VMName,
+        [Parameter(Mandatory=$true)]
+        [string]$VMId,
+        [Parameter(Mandatory=$true)]
+        [pscredential]$Credential,
+        [int]$TimeoutSeconds = 300
+    )
+    Write-StepHeader -StepNumber "5" -EnTitle "Waiting for VM First Boot" -ZhTitle "等待 VM 首次启动"
+    Write-Bilingual -En "Waiting up to $TimeoutSeconds seconds for VM to be ready..." -Zh "最多等待 $TimeoutSeconds 秒让 VM 就绪..."
+
+    $elapsed = 0
+    $ready = $false
+    while ($elapsed -lt $TimeoutSeconds -and -not $ready) {
+        $vm = Resolve-NewVmIdentity -VMName $VMName -VMId $VMId
+        if ($vm -and $vm.State -eq 'Running') {
+            try {
+                $testResult = Invoke-Command -VMId ([guid]$VMId) -Credential $Credential -ScriptBlock {
+                    return "READY"
+                } -ErrorAction Stop -ArgumentList @()
+                if ($testResult -eq "READY") {
+                    $ready = $true
+                    break
+                }
+            }
+            catch {
+                Write-Verbose "PowerShell Direct not ready yet: $_"
+            }
+        }
+        Start-Sleep -Seconds 5
+        $elapsed += 5
+        Write-Host "." -NoNewline
+    }
+    Write-Host ""
+
+    if ($ready) {
+        Write-Bilingual -En "VM is ready for PowerShell Direct." -Zh "VM 已准备好 PowerShell Direct。"
+        return $true
+    } else {
+        Write-Warning "VM did not become ready within $TimeoutSeconds seconds."
+        return $false
+    }
+}
+
+Function Invoke-Phase6_PostBootInstall {
+    param([Parameter(Mandatory=$true)][string]$VMName,[Parameter(Mandatory=$true)][string]$VMId,[Parameter(Mandatory=$true)][pscredential]$Credential)
+    $target = Resolve-NewVmIdentity -VMName $VMName -VMId $VMId
+    if ([string]$target.State -ne 'Running') { throw 'Target VM must be running before guest installation.' }
+    $results = @(Invoke-Command -VMId ([guid]$VMId) -Credential $Credential -ScriptBlock {
+        $postBootPath = 'C:\ProgramData\Easy-GPU-P\PostBoot-Installer.ps1'
+        if (-not (Test-Path -LiteralPath $postBootPath -PathType Leaf)) { throw 'PostBoot installer is missing.' }
+        & $postBootPath
+    } -ErrorAction Stop)
+    $checked = @($results | Where-Object { $_.PSObject.Properties['SchemaVersion'] -and $_.PSObject.Properties['Components'] })
+    if ($checked.Count -ne 1) { throw 'Guest did not return exactly one installation result.' }
+    Assert-GpuPVGuestResult -Result $checked[0] -Config $script:Config
+    return $checked[0]
+}
+
+Function Invoke-Phase7_VerifyAndOutput {
+    param([Parameter(Mandatory=$true)][string]$VMName,[Parameter(Mandatory=$true)][hashtable]$Config,[Parameter(Mandatory=$true)][pscredential]$Credential)
+    $vm = Resolve-NewVmIdentity -VMName $VMName -VMId $Config.TargetVMId
+    if ($vm.State -ne 'Running') { throw 'VM state/identity no longer matches this task.' }
+    if (-not (Get-VMGpuPartitionAdapter -VM $vm -ErrorAction Stop)) { throw 'The requested GPU partition adapter is missing.' }
+    $results = @(Invoke-Command -VMId ([guid]$Config.TargetVMId) -Credential $Credential -ScriptBlock {
+        & 'C:\ProgramData\Easy-GPU-P\PostBoot-Installer.ps1' -VerifyOnly
+    } -ErrorAction Stop)
+    $checked = @($results | Where-Object { $_.PSObject.Properties['SchemaVersion'] -and $_.PSObject.Properties['Components'] })
+    if ($checked.Count -ne 1) { throw 'Guest did not return exactly one verification result.' }
+    Assert-GpuPVGuestResult -Result $checked[0] -Config $Config
+    Write-Host 'Required guest components were observed. Client pairing, login and picture quality still require manual acceptance.'
+    foreach ($action in @($checked[0].ManualActions)) { Write-Host ([string]$action) }
+    return $true
+}
+
+# Borrowed ISO mounts are never released by this workflow.
+function Open-NewVmInstallMedia {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$SourcePath)
+    $resolved = (Resolve-Path -LiteralPath $SourcePath -ErrorAction Stop).ProviderPath
+    $sourceItem = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    if ($sourceItem.PSIsContainer) { throw "Installation media must be a file: $resolved" }
+    $extension = [IO.Path]::GetExtension($resolved)
+    if ($extension -ieq '.wim') {
+        return [pscustomobject]@{ SourcePath=$resolved; ImagePath=$resolved; DriveLetter=$null; MountedByUs=$false }
+    }
+    if ($extension -ine '.iso') { throw 'Supported media is an ISO containing sources\install.wim, or a WIM file.' }
+    $media = [pscustomobject]@{ SourcePath=$resolved; ImagePath=$null; DriveLetter=$null; MountedByUs=$false }
+    try {
+        $diskImage = Get-DiskImage -ImagePath $resolved -StorageType ISO -ErrorAction Stop
+        if (-not $diskImage.Attached) {
+            $null = Mount-DiskImage -ImagePath $resolved -StorageType ISO -Access ReadOnly -PassThru -ErrorAction Stop
+            $media.MountedByUs = $true
+            $diskImage = Get-DiskImage -ImagePath $resolved -StorageType ISO -ErrorAction Stop
+        }
+        $candidates = @()
+        foreach ($volume in @($diskImage | Get-Volume -ErrorAction Stop)) {
+            $letter = [string]$volume.DriveLetter
+            if ($letter -notmatch '^[A-Za-z]$') { continue }
+            $imagePath = "$($letter):\sources\install.wim"
+            if (Test-Path -LiteralPath $imagePath -PathType Leaf) {
+                $candidates += [pscustomobject]@{ ImagePath=$imagePath; DriveLetter=$letter }
+            }
+        }
+        if ($candidates.Count -ne 1) {
+            throw "Expected one accessible sources\install.wim on the ISO; found $($candidates.Count). ESD-only media and ambiguous volumes are unsupported."
+        }
+        $media.ImagePath = $candidates[0].ImagePath
+        $media.DriveLetter = $candidates[0].DriveLetter
+        return $media
+    }
+    catch {
+        $failure = $_
+        try { Close-NewVmInstallMedia -Media $media }
+        catch { Write-Warning "ISO cleanup also failed; inspect the owned mount at '$resolved': $($_.Exception.Message)" }
+        throw $failure
+    }
+}
+
+function Close-NewVmInstallMedia {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Media)
+    if ($null -ne $Media -and $Media.MountedByUs) {
+        $null = Dismount-DiskImage -ImagePath $Media.SourcePath -ErrorAction Stop
+        $Media.MountedByUs = $false
+    }
+}
+
+function Select-NewVmWindowsImage {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Images, [string[]]$Edition)
+    $imagesFound = @($Images | Where-Object { $null -ne $_ })
+    if ($imagesFound.Count -eq 0) { throw 'No Windows images were found in the WIM.' }
+    $selectors = @($Edition | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($selectors.Count -gt 1) { throw 'Specify exactly one Windows edition or image index.' }
+    if ($selectors.Count -eq 0) {
+        if ($imagesFound.Count -ne 1) { throw 'This WIM contains multiple images; specify an edition or image index.' }
+        return $imagesFound[0]
+    }
+    $selector = $selectors[0]
+    $index = 0
+    if ([int]::TryParse($selector, [ref]$index)) {
+        if ($index -lt 1) { throw 'The Windows image index must be positive.' }
+        $matches = @($imagesFound | Where-Object { $_.ImageIndex -eq $index })
+    }
+    else {
+        $matches = @($imagesFound | Where-Object { $_.ImageName -ieq $selector })
+        if ($matches.Count -eq 0) {
+            # Preserve suffix shorthand, but treat user wildcard characters literally.
+            $pattern = '*' + [Management.Automation.WildcardPattern]::Escape($selector)
+            $matches = @($imagesFound | Where-Object { $_.ImageName -ilike $pattern })
+        }
+    }
+    if ($matches.Count -ne 1) { throw "Requested Windows image '$selector' matched $($matches.Count) images; exactly one is required." }
+    return $matches[0]
+}
+
+function Publish-NewVmVhd {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$TemporaryPath, [Parameter(Mandatory=$true)][string]$FinalPath)
+    $source = Get-Item -LiteralPath $TemporaryPath -ErrorAction Stop
+    if ($source.PSIsContainer -or $source.Length -le 0) { throw 'Conversion did not produce a nonempty VHD file.' }
+    if (Test-Path -LiteralPath $FinalPath) { throw "Refusing to replace existing VHD '$FinalPath'. Temporary output is retained at '$TemporaryPath'." }
+    if ([IO.Path]::GetFullPath((Split-Path -Parent $TemporaryPath)) -ine [IO.Path]::GetFullPath((Split-Path -Parent $FinalPath))) {
+        throw 'Final VHD publication must stay in the same directory.'
+    }
+    Rename-Item -LiteralPath $TemporaryPath -NewName (Split-Path -Leaf $FinalPath) -ErrorAction Stop
 }
 
 Function Check-Params {
@@ -134,11 +752,9 @@ if (!(test-path $params.SourcePath)) {
     $ExitReason += "ISO Path Invalid. Please enter a valid ISO Path in the SourcePath section of Params."
     }
 else {
-    $ISODriveLetter = Mount-ISOReliable -SourcePath $params.SourcePath
-    if (!(Test-Path $("$ISODriveLetter"+":\Sources\install.wim"))) {
-        $ExitReason += "This ISO is invalid, please check readme for ISO downloading instructions."
-        }
-    Dismount-ISO -SourcePath $params.SourcePath 
+    $validationMedia = $null
+    try { $validationMedia = Open-NewVmInstallMedia -SourcePath $params.SourcePath }
+    finally { Close-NewVmInstallMedia -Media $validationMedia }
     }
 if ($params.Username -eq $params.VMName ) {
     $ExitReason += "Username cannot be the same as VMName."
@@ -170,7 +786,7 @@ If ($ExitReason.Count -gt 0) {
     ForEach ($IndividualReason in $ExitReason) {
         Write-Host "ERROR: $IndividualReason" -ForegroundColor RED
         }
-    SmartExit
+    SmartExit -ExitReason ($ExitReason -join "`n")
     }
 }
 
@@ -184,43 +800,84 @@ param (
 }
 
 Function Get-BuildVersionExact {
-param (
-    [string]$DriveLetter,  # Drive letter where the ISO is mounted
-    [int]$ImageIndex
-)
-    $mountPath = "$env:TEMP\WIMMount"
-    New-Item -ItemType Directory -Force -Path $mountPath | Out-Null
-
+    [CmdletBinding()]
+    param(
+        [string]$DriveLetter,
+        [Parameter(Mandatory=$true)][ValidateRange(1,2147483647)][int]$ImageIndex,
+        [string]$ImagePath,
+        [string]$TempRoot = $env:TEMP
+    )
+    if ([string]::IsNullOrWhiteSpace($ImagePath)) {
+        if ($DriveLetter -notmatch '^[A-Za-z]$') { throw 'An explicit WIM path or a single ISO drive letter is required.' }
+        $ImagePath = "$($DriveLetter):\sources\install.wim"
+    }
+    $token = [guid]::NewGuid().ToString('N')
+    $mountPath = Join-Path $TempRoot ('GpuPV-Wim-' + $token)
+    $hiveDirectory = Join-Path $TempRoot ('GpuPV-Hive-' + $token)
+    $hiveCopy = Join-Path $hiveDirectory 'SOFTWARE.hiv'
+    $hiveDirectoryOwned = $false
+    $hiveName = 'GpuPV_' + $token
+    $nativeHive = 'HKLM\' + $hiveName
+    $registryKey = 'Registry::HKEY_LOCAL_MACHINE\' + $hiveName + '\Microsoft\Windows NT\CurrentVersion'
+    $wimMounted = $false
+    $hiveLoaded = $false
+    $mountAttempted = $false
+    $primaryFailure = $null
+    $cleanupErrors = @()
+    $null = New-Item -ItemType Directory -Path $mountPath -ErrorAction Stop
     try {
-        # Path to the WIM file
-        $wimPath = "${DriveLetter}:\sources\install.wim"
-   
-        # Mount the WIM file
-        Write-Host "INFO   : Mounting WIM file..."
-        dism /Mount-Wim /WimFile:$wimPath /index:$ImageIndex /MountDir:$mountPath -readonly | Out-Null
-
-        # Load the registry hive
-        $registryPath = "$mountPath\Windows\system32\config\SOFTWARE"
-        reg load HKLM\TEMP $registryPath | Out-Null
-
-        # Query the registry key
-        $query = reg query "HKLM\TEMP\Microsoft\Windows NT\CurrentVersion" /v CurrentBuild
-        $buildVersion = ($query | Select-String -Pattern "CurrentBuild\s+REG_SZ\s+\d+" -AllMatches).Matches.Value -replace ".*\s+REG_SZ\s+", ""
-
-        # Unload the registry hive
-        reg unload HKLM\TEMP | Out-Null
-
-        # Unmount the WIM file
-        Write-Host "INFO   : Unmounting WIM file..."
-        dism /Unmount-Wim /MountDir:$mountPath /discard | Out-Null
-
-        return $buildVersion
+        $mountAttempted = $true
+        $null = Mount-WindowsImage -ImagePath $ImagePath -Path $mountPath -Index $ImageIndex -ReadOnly -ErrorAction Stop
+        $wimMounted = $true
+        $registryPath = Join-Path $mountPath 'Windows\system32\config\SOFTWARE'
+        $null = New-Item -ItemType Directory -Path $hiveDirectory -ErrorAction Stop
+        $hiveDirectoryOwned = $true
+        Copy-Item -LiteralPath $registryPath -Destination $hiveCopy -ErrorAction Stop
+        # Copying a read-only source can preserve its attribute; change only our copy.
+        (Get-Item -LiteralPath $hiveCopy -ErrorAction Stop).IsReadOnly = $false
+        & reg.exe load $nativeHive $hiveCopy | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "reg load failed with exit code $LASTEXITCODE" }
+        $hiveLoaded = $true
+        $property = Get-ItemProperty -LiteralPath $registryKey -Name CurrentBuild -ErrorAction Stop
+        $build = 0
+        if (-not [int]::TryParse([string]$property.CurrentBuild, [ref]$build) -or $build -le 0) { throw 'The offline CurrentBuild value is missing or invalid.' }
+        return $build
     }
-    catch {
-        throw "Failed to retrieve build version for ParsecVDA: $_"
-    }
+    catch { $primaryFailure = $_; throw }
     finally {
-        Remove-Item -Path $mountPath -Recurse -Force
+        if ($hiveLoaded) {
+            try {
+                & reg.exe unload $nativeHive | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "reg unload failed with exit code $LASTEXITCODE" }
+                $hiveLoaded = $false
+            }
+            catch { $cleanupErrors += "Hive '$nativeHive' remains loaded: $($_.Exception.Message)" }
+        }
+        if ($wimMounted) {
+            try {
+                $null = Dismount-WindowsImage -Path $mountPath -Discard -ErrorAction Stop
+                $wimMounted = $false
+                $mountAttempted = $false
+            }
+            catch { $cleanupErrors += "WIM mount '$mountPath' remains attached: $($_.Exception.Message)" }
+        }
+        if (-not $mountAttempted -and -not $wimMounted) {
+            # Never recurse into a mount whose release has not been confirmed.
+            try { [IO.Directory]::Delete($mountPath, $false) }
+            catch { $cleanupErrors += "Could not remove empty mount directory '$mountPath': $($_.Exception.Message)" }
+        }
+        elseif (-not $wimMounted -and $mountAttempted) {
+            $cleanupErrors += "WIM mount failed before ownership was confirmed. Inspect '$mountPath'; it was left untouched."
+        }
+        if ($hiveDirectoryOwned -and -not $hiveLoaded) {
+            try { [IO.Directory]::Delete($hiveDirectory, $true) }
+            catch { $cleanupErrors += "Could not remove owned hive copy '$hiveDirectory': $($_.Exception.Message)" }
+        }
+        if ($cleanupErrors.Count -gt 0) {
+            $message = $cleanupErrors -join '; '
+            if ($null -ne $primaryFailure) { Write-Warning $message }
+            else { throw $message }
+        }
     }
 }
 
@@ -244,7 +901,7 @@ param (
     # Check if build version is between 19041 and 19045
     if ($buildVersion -lt $win10_22H2_version -and $buildVersion -ge $win2004) {
         Write-Host "INFO   : Checking ParsecVDA compatibility under specified Windows 10 ISO. This could take awhile..."
-        $buildVersion = Get-BuildVersionExact -Driveletter $Driveletter -ImageIndex $ImageIndex
+        $buildVersion = Get-BuildVersionExact -Driveletter $Driveletter -ImageIndex $ImageIndex -ImagePath $SourcePath
         
         # Define version constants
         $win10_21H2_int = "19044"
@@ -291,57 +948,109 @@ param(
 [bool]$Sunshine,
 [bool]$VirtualDisplayDriver,
 [string]$Team_ID,
-[string]$Key
+[string]$Key,
+[string]$LocalParsecPath = "",
+[string]$LocalSunshinePath = "",
+[string]$LocalVBCableZipPath = "",
+[string]$LocalParsecVDAPath = "",
+[string]$LocalVirtualDisplayDriverPath = "",
+[string]$LocalVirtualDisplayDriverHDRPath = "",
+[string]$SecurityModel = "HostDownload",
+[string]$SourcePath = "",
+[int]$ImageIndex = 1
 )
+    # Ensure target directory exists / 确保目标目录存在
+    if (-not (Test-Path -Path "$DriveLetter\ProgramData\Easy-GPU-P")) {
+        New-Item -Path "$DriveLetter\ProgramData\Easy-GPU-P" -ItemType Directory -Force | Out-Null
+    }
+
+    # Copy VMScripts to VM (always needed for display shortcuts etc.) / 复制 VMScripts 到 VM（显示快捷方式等始终需要）
+    Copy-Item -Path $psscriptroot\VMScripts\VBCableInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\ParsecVDAInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\VirtualDisplayDriverInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\VirtualDisplayDriverHDRInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path "$psscriptroot\VMScripts\Switch Display to ParsecVDA.bat" -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path "$psscriptroot\VMScripts\Switch Display to Virtual Display.bat" -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\ParsecVDA.ico -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\VirtualDisplayDriver.ico -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\SwitchDisplayParsecVDA.vbs -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\SwitchDisplayVDD.vbs -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\Parsec.lnk -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $psscriptroot\VMScripts\DisableOneDriveAutostart.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P -Force -ErrorAction SilentlyContinue
+
+    # Copy local installer files if provided / 如果提供了本地安装文件，则复制到虚拟机
+    $localInstallersDir = "$DriveLetter\ProgramData\Easy-GPU-P\LocalInstallers"
+    $localPathsContent = @()
+    $localFiles = @{
+        LocalParsecPath = $LocalParsecPath
+        LocalSunshinePath = $LocalSunshinePath
+        LocalVBCableZipPath = $LocalVBCableZipPath
+        LocalVirtualAudioDriverPath = $LocalVirtualAudioDriverPath
+        LocalParsecVDAPath = $LocalParsecVDAPath
+        LocalVirtualDisplayDriverPath = $LocalVirtualDisplayDriverPath
+        LocalVirtualDisplayDriverHDRPath = $LocalVirtualDisplayDriverHDRPath
+    }
+    foreach ($key in $localFiles.Keys) {
+        $src = $localFiles[$key]
+        if ($src -and (Test-Path $src)) {
+            if (-not (Test-Path $localInstallersDir)) {
+                New-Item -ItemType Directory -Path $localInstallersDir -Force | Out-Null
+            }
+            $dest = Join-Path $localInstallersDir (Split-Path $src -Leaf)
+            Copy-Item -Path $src -Destination $dest -Force
+            $localPathsContent += "`$$key = `"$dest`""
+        }
+    }
+    if ($localPathsContent.Count -gt 0) {
+        Set-Content -Path "$localInstallersDir\LocalPaths.ps1" -Value ($localPathsContent -join "`r`n") -Encoding UTF8
+    }
+
+    # Skip Group Policy setup for HostDownload mode (PowerShell Direct will handle installation)
+    # HostDownload 模式跳过 Group Policy 设置（PowerShell Direct 将处理安装）
+    if ($SecurityModel -eq "HostDownload") {
+        Write-Host "INFO   : HostDownload mode - skipping Group Policy logon scripts." -ForegroundColor Green
+        return
+    }
+
+    # --- VMDownload mode: set up Group Policy logon scripts ---
     $new = @()
-
-    $content = get-content "$PSScriptRoot\user\psscripts.ini" 
-
+    $content = Get-Content -LiteralPath (Resolve-GpuPVUserTemplate $PSScriptRoot "psscripts.ini")
     foreach ($line in $content) {
         if ($line -like "0Parameters="){
             $line = "0Parameters=$Team_ID $Key"
             $new += $line
-            }
-        else {
+        } else {
             $new += $line
-            }
+        }
     }
-    Set-Content -Value $new -Path "$PSScriptRoot\user\psscripts.ini"
-    if((Test-Path -Path $DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon) -eq $true) {} Else {New-Item -Path $DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon -ItemType directory | Out-Null}
-    if((Test-Path -Path $DriveLetter\ProgramData\Easy-GPU-P) -eq $true) {} Else {New-Item -Path $DriveLetter\ProgramData\Easy-GPU-P -ItemType directory | Out-Null}
-    Copy-Item -Path $psscriptroot\VMScripts\VBCableInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\ParsecVDAInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\VirtualDisplayDriverInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\VirtualDisplayDriverHDRInstall.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path "$psscriptroot\VMScripts\Switch Display to ParsecVDA.bat" -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path "$psscriptroot\VMScripts\Switch Display to Virtual Display.bat" -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\ParsecVDA.ico -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\VirtualDisplayDriver.ico -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\SwitchDisplayParsecVDA.vbs -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\SwitchDisplayVDD.vbs -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\Parsec.lnk -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\VMScripts\DisableOneDriveAutostart.ps1 -Destination $DriveLetter\ProgramData\Easy-GPU-P
-    Copy-Item -Path $psscriptroot\gpt.ini -Destination $DriveLetter\Windows\system32\GroupPolicy
-    Copy-Item -Path $psscriptroot\User\psscripts.ini -Destination $DriveLetter\Windows\system32\GroupPolicy\User\Scripts
-    
+    # The source template is never rewritten with account-specific data.
+    if (-not (Test-Path -Path "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon")) {
+        New-Item -Path "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon" -ItemType Directory -Force | Out-Null
+    }
+    Copy-Item -Path $psscriptroot\gpt.ini -Destination "$DriveLetter\Windows\system32\GroupPolicy" -Force
+    Set-Content -Value $new -LiteralPath "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\psscripts.ini" -Encoding UTF8
+
     $withHDR = Check-BuildVersionforVDD -SourcePath $SourcePath -ImageIndex $ImageIndex -VirtualDisplayDriver $VirtualDisplayDriver
-   
+
     # Check which streaming software and Virtual Display was chosen and copy the appropriate script
+    $targetScript = $null
     if ($Parsec -and $ParsecVDA) {
-        Copy-Item -Path "$PSScriptRoot\User\Installation with Parsec + ParsecVDA.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation with Parsec + ParsecVDA.ps1"
     } elseif ($Parsec -and $VirtualDisplayDriver -and $withHDR) {
-        Copy-Item -Path "$PSScriptRoot\User\Installation with Parsec + VirtualDisplayDriverHDR.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation with Parsec + VirtualDisplayDriverHDR.ps1"
     } elseif ($Parsec -and $VirtualDisplayDriver) {
-        Copy-Item -Path "$PSScriptRoot\User\Installation with Parsec + VirtualDisplayDriver.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation with Parsec + VirtualDisplayDriver.ps1"
     } elseif ($Sunshine -and $ParsecVDA) {
-        Copy-Item -Path "$PSScriptRoot\User\Installation with Sunshine + ParsecVDA.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation with Sunshine + ParsecVDA.ps1"
     } elseif ($Sunshine -and $VirtualDisplayDriver -and $withHDR) {
-        Copy-Item -Path "$PSScriptRoot\User\Installation with Sunshine + VirtualDisplayDriverHDR.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation with Sunshine + VirtualDisplayDriverHDR.ps1"
     } elseif ($Sunshine -and $VirtualDisplayDriver) {
-        Copy-Item -Path "$PSScriptRoot\User\Installation with Sunshine + VirtualDisplayDriver.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation with Sunshine + VirtualDisplayDriver.ps1"
     } else {
-        Copy-Item -Path "$PSScriptRoot\User\Installation just GPU-PV.ps1" -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1"
+        $targetScript = "$PSScriptRoot\User\Installation just GPU-PV.ps1"
     }
+    $targetScript = Resolve-GpuPVUserTemplate $PSScriptRoot ([IO.Path]::GetFileName($targetScript))
+    Copy-Item -LiteralPath $targetScript -Destination "$DriveLetter\Windows\system32\GroupPolicy\User\Scripts\Logon\Install.ps1" -Force
 }
 
 Function Convert-WindowsImage {
@@ -573,6 +1282,30 @@ Function Convert-WindowsImage {
         [string]
         #[ValidateNotNullOrEmpty()]
         [string]$Key,
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalParsecPath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalSunshinePath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalVBCableZipPath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalVirtualAudioDriverPath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalParsecVDAPath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalVirtualDisplayDriverPath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$LocalVirtualDisplayDriverHDRPath = "",
+
+        [Parameter(ParameterSetName="SRC")]
+        [string]$SecurityModel = "HostDownload",
 
         [Parameter(ParameterSetName="SRC")]
         [switch]
@@ -971,6 +1704,7 @@ Function Convert-WindowsImage {
 
     Begin
     {
+        if ($ShowUI) { throw 'The legacy Convert-WindowsImage UI is unsupported. Use the checked NewVM configuration wizard.' }
         ##########################################################################################
         #                             Constants and Pseudo-Constants
         ##########################################################################################
@@ -1073,9 +1807,8 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
                 throw
             }
 
-            # Set a global variable containing the name of the mounted registry key
-            # so we can unmount it if there's an error.
-            $global:mountedHive = $mountKey
+            # Record ownership in the per-conversion object.
+            $conversionResources.Hives += $mountKey
 
             return $mountKey
         }
@@ -1101,7 +1834,7 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
 
             Run-Executable -Executable $regPath -Arguments $regArgs
 
-            $global:mountedHive = $null
+            $conversionResources.Hives = @($conversionResources.Hives | Where-Object { $_ -ne $HiveMountPoint })
         }
 
         ##########################################################################################
@@ -1327,9 +2060,12 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
         $openImage      = $null
         $vhdFinalName   = $null
         $vhdFinalPath   = $null
-        $mountedHive    = $null
-        $isoPath        = $null
-        $tempSource     = $null
+        $conversionResources = @{ Hives=@(); VhdMounted=$false }
+        $conversionMedia = $null
+        $conversionFailure = $null
+        $driveLetter = $ISODriveLetter
+        $tempSource = $null
+        $transcripting = $false
 
         if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)
         {
@@ -1364,17 +2100,8 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
 
             $null = md $logFolder -Force
 
-            # Try to start transcripting.  If it's already running, we'll get an exception and swallow it.
-            try
-            {
-                $null = Start-Transcript -Path (Join-Path $logFolder "Convert-WindowsImageTranscript.txt") -Force -ErrorAction SilentlyContinue
-                $transcripting = $true
-            }
-            catch
-            {
-                Write-W2VWarn "Transcription is already running.  No Convert-WindowsImage-specific transcript will be created."
-                $transcripting = $false
-            }
+            # No automatic transcript: unattended setup may contain credentials.
+            $transcripting = $false
 
             #
             # Add types
@@ -1563,7 +2290,7 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
                         }
                         finally
                         {
-                            $tempOpenWim.Close()
+                            if ($null -ne $tempOpenWim) { $tempOpenWim.Close() }
                             Write-W2VTrace "Closing WIM metadata..."
                         }
                     }
@@ -2137,88 +2864,23 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
 
             Write-W2VTrace "Temporary $VHDFormat path is : $VHDPath"
 
-            # If we're using an ISO, mount it and get the path to the WIM file.
-            if (([IO.FileInfo]$SourcePath).Extension -ilike ".ISO")
+            if (([IO.Path]::GetExtension($SourcePath)) -ieq '.iso')
             {
-                # If the ISO isn't local, copy it down so we don't have to worry about resource contention
-                # or about network latency.
-                if (Test-IsNetworkLocation $SourcePath)
-                {
-                    Write-W2VError "ISO Path cannot be network location"
-                    #Write-W2VInfo "Copying ISO $(Split-Path $SourcePath -Leaf) to temp folder..."
-                    #robocopy $(Split-Path $SourcePath -Parent) $TempDirectory $(Split-Path $SourcePath -Leaf) | Out-Null
-                    #$SourcePath = "$($TempDirectory)\$(Split-Path $SourcePath -Leaf)"
-                    #$tempSource = $SourcePath
-                }
-
-                $isoPath = (Resolve-Path $SourcePath).Path
-
-                Write-W2VInfo "Opening ISO $(Split-Path $isoPath -Leaf)..."
-                <#
-                $openIso     = Mount-DiskImage -ImagePath $isoPath -StorageType ISO -PassThru
-                # Refresh the DiskImage object so we can get the real information about it.  I assume this is a bug.
-                $openIso     = Get-DiskImage -ImagePath $isoPath
-                $driveLetter = ($openIso | Get-Volume).DriveLetter
-                #>
-                $SourcePath  = "$($DriveLetter):\sources\install.wim"
-
-                # Check to see if there's a WIM file we can muck about with.
-                Write-W2VInfo "Looking for $($SourcePath)..."
-                if (!(Test-Path $SourcePath))
-                {
-                    throw "The specified ISO does not appear to be valid Windows installation media."
-                }
+                if (Test-IsNetworkLocation $SourcePath) { throw 'ISO path must be local.' }
+                $conversionMedia = Open-NewVmInstallMedia -SourcePath $SourcePath
+                $SourcePath = $conversionMedia.ImagePath
+                $driveLetter = $conversionMedia.DriveLetter
             }
-
-            # Check to see if the WIM is local, or on a network location.  If the latter, copy it locally.
             if (Test-IsNetworkLocation $SourcePath)
             {
-                Write-W2VInfo "Copying WIM $(Split-Path $SourcePath -Leaf) to temp folder..."
-                robocopy $(Split-Path $SourcePath -Parent) $TempDirectory $(Split-Path $SourcePath -Leaf) | Out-Null
-                $SourcePath = "$($TempDirectory)\$(Split-Path $SourcePath -Leaf)"
-
-                $tempSource = $SourcePath
+                # Use the unique session directory, never a shared temporary filename.
+                $tempSource = Join-Path $logFolder ('source-' + [IO.Path]::GetFileName($SourcePath))
+                Copy-Item -LiteralPath $SourcePath -Destination $tempSource -ErrorAction Stop
+                $SourcePath = $tempSource
             }
-
-            $SourcePath  = (Resolve-Path $SourcePath).Path
-
-            ####################################################################################################
-            # QUERY WIM INFORMATION AND EXTRACT THE INDEX OF TARGETED IMAGE
-            ####################################################################################################
-
-            Write-W2VInfo "Looking for the requested Windows image in the WIM file"
-            $WindowsImage = Get-WindowsImage -ImagePath "$($driveLetter):\sources\install.wim"
-
-            if (-not $WindowsImage -or ($WindowsImage -is [System.Array]))
-            {
-                #
-                # WIM may have multiple images.  Filter on Edition (can be index or name) and try to find a unique image
-                #
-                $EditionIndex = 0;
-                if ([Int32]::TryParse($Edition, [ref]$EditionIndex))
-                {
-                    $WindowsImage = Get-WindowsImage -ImagePath $SourcePath -Index $EditionIndex
-                }
-                else
-                {
-                    $WindowsImage = Get-WindowsImage -ImagePath $SourcePath | Where-Object {$_.ImageName -ilike "*$($Edition)"}
-                }
-
-                if (-not $WindowsImage)
-                {
-                    throw "Requested windows Image was not found on the WIM file!"
-                }
-                if ($WindowsImage -is [System.Array])
-                {
-                    Write-W2VInfo "WIM file has the following $($WindowsImage.Count) images that match filter *$($Edition)"
-                    Get-WindowsImage -ImagePath $SourcePath
-
-                    Write-W2VError "You must specify an Edition or SKU index, since the WIM has more than one image."
-                    throw "There are more than one images that match ImageName filter *$($Edition)"
-                }
-            }
-
-            $ImageIndex = $WindowsImage[0].ImageIndex
+            $SourcePath = (Resolve-Path -LiteralPath $SourcePath -ErrorAction Stop).ProviderPath
+            $WindowsImage = Select-NewVmWindowsImage -Images @(Get-WindowsImage -ImagePath $SourcePath -ErrorAction Stop) -Edition $Edition
+            $ImageIndex = $WindowsImage.ImageIndex
 
             # Call the Check-BuildVersion function
             Check-BuildVersionforParsecVDA -Driveletter $Driveletter -SourcePath $SourcePath -ImageIndex $ImageIndex -ParsecVDA $ParsecVDA
@@ -2259,7 +2921,9 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
                 $newVhd = New-VHD -Path $VHDPath -SizeBytes $SizeBytes -BlockSizeBytes $BlockSizeBytes -Dynamic
 
                 Write-W2VInfo "Mounting $VHDFormat..."
-                $disk = $newVhd | Mount-VHD -PassThru | Get-Disk
+                $mountedVhd = $newVhd | Mount-VHD -PassThru -ErrorAction Stop
+                $conversionResources.VhdMounted = $true
+                $disk = $mountedVhd | Get-Disk -ErrorAction Stop
             }
             else
             {
@@ -2284,7 +2948,9 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
 
                 # Attach the VHD.\
                 Write-W2VInfo "Attaching $VHDFormat..."
-                $disk = Mount-DiskImage -ImagePath $VHDPath -PassThru | Get-DiskImage | Get-Disk
+                $mountedVhd = Mount-DiskImage -ImagePath $VHDPath -PassThru -ErrorAction Stop
+                $conversionResources.VhdMounted = $true
+                $disk = $mountedVhd | Get-DiskImage -ErrorAction Stop | Get-Disk -ErrorAction Stop
             }
 
             switch ($DiskLayout)
@@ -2661,6 +3327,7 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
             If ($Feature)
             {
                 Write-W2VInfo -text "Installing Windows Feature(s) $Feature to the Image"
+                if ($driveLetter -notmatch '^[A-Za-z]$') { throw 'Installing optional features requires an explicit mounted ISO source.' }
                 $FeatureSourcePath = Join-Path -Path "$($driveLetter):" -ChildPath "sources\sxs"
                 Write-W2VInfo -text "From $FeatureSourcePath"
                 Enable-WindowsOptionalFeature -FeatureName $Feature -Source $FeatureSourcePath -Path $windowsDrive -All | Out-Null
@@ -2681,11 +3348,12 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
             #
 
             if (($GPUName)) {
-            Add-VMGpuPartitionAdapterFiles -GPUName $GPUName -DriveLetter $windowsDrive
+            $gpuTarget = New-GpuPVTargetFromMountedDisk -VhdPath $VHDPath -DiskNumber $disk.Number -CreationOwned -PartitionNumber $windowsPartition.PartitionNumber
+            Add-VMGpuPartitionAdapterFiles -GPUName $GPUName -Target $gpuTarget
             }
 
             Write-W2VInfo "Setting up programs to install at boot"
-            Setup-ParsecInstall -DriveLetter $WindowsDrive -Parsec $Parsec -ParsecVDA $ParsecVDA -Sunshine $Sunshine -VirtualDisplayDriver $VirtualDisplayDriver -Team_ID $Team_ID -Key $Key
+            Setup-ParsecInstall -DriveLetter $WindowsDrive -Parsec $Parsec -ParsecVDA $ParsecVDA -Sunshine $Sunshine -VirtualDisplayDriver $VirtualDisplayDriver -Team_ID $Team_ID -Key $Key -LocalParsecPath $LocalParsecPath -LocalSunshinePath $LocalSunshinePath -LocalVBCableZipPath $LocalVBCableZipPath -LocalVirtualAudioDriverPath $LocalVirtualAudioDriverPath -LocalParsecVDAPath $LocalParsecVDAPath -LocalVirtualDisplayDriverPath $LocalVirtualDisplayDriverPath -LocalVirtualDisplayDriverHDRPath $LocalVirtualDisplayDriverHDRPath -SecurityModel $SecurityModel -SourcePath $SourcePath -ImageIndex $ImageIndex
 
             if ($DiskLayout -eq "UEFI")
             {
@@ -2737,88 +3405,76 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
             if ($hyperVEnabled)
             {
                 Write-W2VInfo "Dismounting $VHDFormat..."
-                Dismount-VHD -Path $VHDPath
+                Dismount-VHD -Path $VHDPath -ErrorAction Stop
             }
             else
             {
                 Write-W2VInfo "Closing $VHDFormat..."
-                Dismount-DiskImage -ImagePath $VHDPath
+                Dismount-DiskImage -ImagePath $VHDPath -ErrorAction Stop
             }
+            $conversionResources.VhdMounted = $false
 
             $vhdFinalPath = Join-Path (Split-Path $VHDPath -Parent) $vhdFinalName
             Write-W2VTrace "$VHDFormat final path is : $vhdFinalPath"
 
-            if (Test-Path $vhdFinalPath)
-            {
-                Write-W2VInfo "Deleting pre-existing $VHDFormat : $(Split-Path $vhdFinalPath -Leaf)..."
-                Remove-Item -Path $vhdFinalPath -Force
-            }
-
-            Write-W2VTrace -Text "Renaming $VHDFormat at $VHDPath to $vhdFinalName"
-            Rename-Item -Path (Resolve-Path $VHDPath).Path -NewName $vhdFinalName -Force
+            Publish-NewVmVhd -TemporaryPath $VHDPath -FinalPath $vhdFinalPath
             $vhd += Get-DiskImage -ImagePath $vhdFinalPath
 
             $vhdFinalName = $null
         }
         catch
         {
+            $conversionFailure = $_
             Write-W2VError $_
             Write-W2VInfo "Log folder is $logFolder"
+            throw
         }
         finally
         {
-            # If we still have a WIM image open, close it.
-            if ($openWim -ne $null)
+            $cleanupErrors = @()
+            if ($null -ne $openWim)
             {
-                Write-W2VInfo "Closing Windows image..."
-                $openWim.Close()
+                try { $openWim.Close(); $openWim = $null }
+                catch { $cleanupErrors += "WIM handle close failed: $($_.Exception.Message)" }
             }
-
-            # If we still have a registry hive mounted, dismount it.
-            if ($mountedHive -ne $null)
+            foreach ($ownedHive in @($conversionResources.Hives))
             {
-                Write-W2VInfo "Closing registry hive..."
-                Dismount-RegistryHive -HiveMountPoint $mountedHive
+                try { Dismount-RegistryHive -HiveMountPoint $ownedHive }
+                catch { $cleanupErrors += "Registry hive '$ownedHive' remains loaded: $($_.Exception.Message)" }
             }
-
-            # If VHD is mounted, unmount it
-            if (Test-Path $VHDPath)
+            if ($conversionResources.VhdMounted)
             {
-                if ($hyperVEnabled)
-                {
-                    if ((Get-VHD -Path $VHDPath).Attached)
-                    {
-                        Dismount-VHD -Path $VHDPath
+                if ($conversionResources.Hives.Count -gt 0) {
+                    $cleanupErrors += "VHD '$VHDPath' retained because an owned registry hive is still loaded."
+                }
+                else {
+                    try {
+                        if ($hyperVEnabled) { Dismount-VHD -Path $VHDPath -ErrorAction Stop }
+                        else { Dismount-DiskImage -ImagePath $VHDPath -ErrorAction Stop }
+                        $conversionResources.VhdMounted = $false
                     }
-                }
-                else
-                {
-                    Dismount-DiskImage -ImagePath $VHDPath
+                    catch { $cleanupErrors += "VHD '$VHDPath' dismount failed: $($_.Exception.Message)" }
                 }
             }
-
-            # If we still have an ISO open, close it.
-            if ($openIso -ne $null)
+            try { Close-NewVmInstallMedia -Media $conversionMedia }
+            catch { $cleanupErrors += "ISO dismount failed: $($_.Exception.Message)" }
+            if (-not $CacheSource -and $tempSource -and $null -eq $openWim)
             {
-                Write-W2VInfo "Closing ISO..."
-                Dismount-DiskImage $ISOPath
+                try { if (Test-Path -LiteralPath $tempSource) { Remove-Item -LiteralPath $tempSource -Force -ErrorAction Stop } }
+                catch { $cleanupErrors += "Owned cached WIM removal failed: $($_.Exception.Message)" }
             }
-
-            if (-not $CacheSource)
-            {
-                if ($tempSource -and (Test-Path $tempSource))
-                {
-                    Remove-Item -Path $tempSource -Force
-                }
-            }
-
-            # Close out the transcript and tell the user we're done.
-            Dismount-ISO -SourcePath $ISOPath
-            Write-W2VInfo "Done."
             if ($transcripting)
             {
-                $null = Stop-Transcript
+                try { $null = Stop-Transcript -ErrorAction Stop }
+                catch { $cleanupErrors += "Transcript close failed: $($_.Exception.Message)" }
             }
+            if ($cleanupErrors.Count -gt 0)
+            {
+                $message = $cleanupErrors -join '; '
+                if ($null -ne $conversionFailure) { Write-Warning $message }
+                else { throw $message }
+            }
+            if ($null -eq $conversionFailure) { Write-W2VInfo 'Done.' }
         }
     }
 
@@ -4479,82 +5135,6 @@ VirtualHardDisk
     }
 }
 
-Function Modify-AutoUnattend {
-param (
-    [string]$username,
-    [string]$password,
-    [string]$autologon,
-    [string]$hostname,
-    [string]$language,
-    [string]$timezone,
-    [string]$UnattendPath
-)
-    [xml]$xml = Get-Content -Path $UnattendPath
-
-    # Modify autologon settings
-    ($xml.unattend.settings.component | Where-Object { $_.AutoLogon }).AutoLogon.Password.Value = $password
-    ($xml.unattend.settings.component | Where-Object { $_.AutoLogon }).AutoLogon.Username = $username
-    ($xml.unattend.settings.component | Where-Object { $_.AutoLogon }).AutoLogon.Enabled = $autologon
-
-    # Modify local account settings
-    ($xml.unattend.settings.component | Where-Object { $_.UserAccounts }).UserAccounts.LocalAccounts.LocalAccount.Group = "Administrators"
-    ($xml.unattend.settings.component | Where-Object { $_.UserAccounts }).UserAccounts.LocalAccounts.LocalAccount.Name = $username
-    ($xml.unattend.settings.component | Where-Object { $_.UserAccounts }).UserAccounts.LocalAccounts.LocalAccount.DisplayName = $username
-    ($xml.unattend.settings.component | Where-Object { $_.UserAccounts }).UserAccounts.LocalAccounts.LocalAccount.Password.Value = $password
-
-    # Modify computer name
-    ($xml.unattend.settings.component | Where-Object { $_.ComputerName }).ComputerName = $hostname
-
-    # Modify language and input locale settings (both occurrences)
-    $internationalCoreWinPE = ($xml.unattend.settings.component | Where-Object { $_.SetupUILanguage })
-    $internationalCoreWinPE.SetupUILanguage.UILanguage = $language
-    $internationalCoreWinPE.InputLocale = $language
-    $internationalCoreWinPE.SystemLocale = $language
-    $internationalCoreWinPE.UILanguage = $language
-    $internationalCoreWinPE.UILanguageFallback = $language
-    $internationalCoreWinPE.UserLocale = $language
-
-    $internationalCore = ($xml.unattend.settings.component | Where-Object { $_.name -eq 'Microsoft-Windows-International-Core' })
-    $internationalCore.InputLocale = $language
-    $internationalCore.SystemLocale = $language
-    $internationalCore.UILanguage = $language
-    $internationalCore.UILanguageFallback = $language
-    $internationalCore.UserLocale = $language
-
-    # Modify timezone
-    $oobeSystemComponent = $xml.unattend.settings | Where-Object { $_.pass -eq 'oobeSystem' }
-    $shellSetupComponent = $oobeSystemComponent.component | Where-Object { $_.name -eq 'Microsoft-Windows-Shell-Setup' }
-    $shellSetupComponent.TimeZone = $timezone
-
-    $xml.Save("$UnattendPath")
-}
-
-Function Assign-VMGPUPartitionAdapter {
-param(
-[string]$VMName,
-[string]$GPUName,
-[decimal]$GPUResourceAllocationPercentage = 100
-)
-    $PartitionableGPUList = Get-WmiObject -Class "Msvm_PartitionableGpu" -ComputerName $env:COMPUTERNAME -Namespace "ROOT\virtualization\v2" 
-    if ($GPUName -eq "AUTO") {
-        $DevicePathName = $PartitionableGPUList.Name[0]
-        Add-VMGpuPartitionAdapter -VMName $VMName
-        }
-    else {
-        $DeviceID = ((Get-WmiObject Win32_PNPSignedDriver | where {($_.Devicename -eq "$GPUNAME")}).hardwareid).split('\')[1]
-        $DevicePathName = ($PartitionableGPUList | Where-Object name -like "*$deviceid*").Name
-        Add-VMGpuPartitionAdapter -VMName $VMName -InstancePath $DevicePathName
-        }
-
-    [float]$devider = [math]::round($(100 / $GPUResourceAllocationPercentage),2)
-
-    Set-VMGpuPartitionAdapter -VMName $VMName -MinPartitionVRAM ([math]::round($(1000000000 / $devider))) -MaxPartitionVRAM ([math]::round($(1000000000 / $devider))) -OptimalPartitionVRAM ([math]::round($(1000000000 / $devider)))
-    Set-VMGPUPartitionAdapter -VMName $VMName -MinPartitionEncode ([math]::round($(18446744073709551615 / $devider))) -MaxPartitionEncode ([math]::round($(18446744073709551615 / $devider))) -OptimalPartitionEncode ([math]::round($(18446744073709551615 / $devider)))
-    Set-VMGpuPartitionAdapter -VMName $VMName -MinPartitionDecode ([math]::round($(1000000000 / $devider))) -MaxPartitionDecode ([math]::round($(1000000000 / $devider))) -OptimalPartitionDecode ([math]::round($(1000000000 / $devider)))
-    Set-VMGpuPartitionAdapter -VMName $VMName -MinPartitionCompute ([math]::round($(1000000000 / $devider))) -MaxPartitionCompute ([math]::round($(1000000000 / $devider))) -OptimalPartitionCompute ([math]::round($(1000000000 / $devider)))
-
-}
-
 Function New-GPUEnabledVM {
 param(
 [int64]$SizeBytes,
@@ -4568,7 +5148,8 @@ param(
 [int]$CPUCores,
 [string]$NetworkSwitch,
 [string]$GPUName,
-[float]$GPUResourceAllocationPercentage,
+[decimal]$GPUResourceAllocationPercentage = 50,
+$GPUAllocationPolicy = $null,
 [string]$SourcePath,
 [bool]$Parsec,
 [bool]$ParsecVDA,
@@ -4580,109 +5161,206 @@ param(
 [string]$password,
 [string]$language,
 [string]$timezone,
-[string]$autologon
+[string]$autologon,
+[string]$LocalParsecPath = "",
+[string]$LocalSunshinePath = "",
+[string]$LocalVBCableZipPath = "",
+[string]$LocalVirtualAudioDriverPath = "",
+[string]$LocalParsecVDAPath = "",
+[string]$LocalVirtualDisplayDriverPath = "",
+[string]$LocalVirtualDisplayDriverHDRPath = "",
+[string]$SecurityModel = "HostDownload"
 )
     $VHDPath = ConcatenateVHDPath -VHDPath $VHDPath -VMName $VMName
-    $DriveLetter = Mount-ISOReliable -SourcePath $SourcePath
 
+    # Validate VM/VHD do not exist BEFORE mounting the ISO, so SmartExit does not leave the ISO mounted.
+    # 在挂载 ISO 前验证 VM/VHD 不存在，避免 SmartExit 导致 ISO 残留挂载。
     if ($(Get-VM -Name $VMName -ErrorAction SilentlyContinue) -ne $NULL) {
-        SmartExit -ExitReason "Virtual Machine already exists with name $VMName, please delete existing VM or change VMName"
+        throw "A VM named '$VMName' already exists. Inspect it manually or choose a new name; this workflow will not adopt or delete it."
         }
     if (Test-Path $vhdPath) {
-        SmartExit -ExitReason "Virtual Machine Disk already exists at $vhdPath, please delete existing VHDX or change VMName"
+        throw "A disk already exists at '$vhdPath'. Inspect it manually or choose a new name; it will not be overwritten."
         }
-    Modify-AutoUnattend -username "$username" -password "$password" -autologon $autologon -hostname $VMName -language "$language" -timezone "$timezone" -UnattendPath $UnattendPath
+    $creationMedia = $null
+    $creationFailure = $null
+    $temporaryUnattend = Join-Path $PSScriptRoot (".unattend-" + [guid]::NewGuid().ToString("N") + ".xml")
+    try {
+        $creationMedia = Open-NewVmInstallMedia -SourcePath $SourcePath
+        $DriveLetter = $creationMedia.DriveLetter
+        Copy-Item -LiteralPath $UnattendPath -Destination $temporaryUnattend -ErrorAction Stop
+        Modify-AutoUnattend -username $username -password $password -autologon $autologon -hostname $VMName -language $language -timezone $timezone -UnattendPath $temporaryUnattend
     $MaxAvailableVersion = (Get-VMHostSupportedVersion).Version | Where-Object {$_.Major -lt 254}| Select-Object -Last 1 
-    Convert-WindowsImage -SourcePath $SourcePath -ISODriveLetter $DriveLetter -Edition $Edition -VHDFormat $Vhdformat -VHDPath $VhdPath -DiskLayout $DiskLayout -UnattendPath $UnattendPath -GPUName $GPUName -Parsec $Parsec -ParsecVDA $ParsecVDA -Sunshine $Sunshine -VirtualDisplayDriver $VirtualDisplayDriver -Team_ID $Team_ID -Key $Key -SizeBytes $SizeBytes| Out-Null
+    Convert-WindowsImage -SourcePath $SourcePath -ISODriveLetter $DriveLetter -Edition $Edition -VHDFormat $Vhdformat -VHDPath $VhdPath -DiskLayout $DiskLayout -UnattendPath $temporaryUnattend -GPUName $GPUName -Parsec $Parsec -ParsecVDA $ParsecVDA -Sunshine $Sunshine -VirtualDisplayDriver $VirtualDisplayDriver -Team_ID $Team_ID -Key $Key -LocalParsecPath $LocalParsecPath -LocalSunshinePath $LocalSunshinePath -LocalVBCableZipPath $LocalVBCableZipPath -LocalVirtualAudioDriverPath $LocalVirtualAudioDriverPath -LocalParsecVDAPath $LocalParsecVDAPath -LocalVirtualDisplayDriverPath $LocalVirtualDisplayDriverPath -LocalVirtualDisplayDriverHDRPath $LocalVirtualDisplayDriverHDRPath -SecurityModel $SecurityModel -SizeBytes $SizeBytes | Out-Null
+
+    }
+    catch { $creationFailure = $_; throw }
+    finally {
+        $creationCleanupErrors = @()
+        try { if (Test-Path -LiteralPath $temporaryUnattend) { Remove-Item -LiteralPath $temporaryUnattend -Force -ErrorAction Stop } }
+        catch { $creationCleanupErrors += "Temporary unattended file removal failed: $($_.Exception.Message)" }
+        try { Close-NewVmInstallMedia -Media $creationMedia }
+        catch { $creationCleanupErrors += "ISO cleanup failed: $($_.Exception.Message)" }
+        if ($creationCleanupErrors.Count -gt 0) {
+            $message = $creationCleanupErrors -join '; '
+            if ($null -ne $creationFailure) { Write-Warning $message } else { throw $message }
+        }
+    }
+    $finalizedDisk = Get-Item -LiteralPath $VhdPath -ErrorAction Stop
+    if ($finalizedDisk.PSIsContainer -or $finalizedDisk.Length -le 0) { throw 'Conversion did not produce a nonempty finalized VHD file.' }
+
+    # HostDownload: copy installer files to VHDX / HostDownload: 复制安装文件到 VHDX
+    if ($SecurityModel -eq "HostDownload" -and (Test-Path $VhdPath)) {
+        Write-Host "INFO   : HostDownload mode - copying installer files to VHDX..." -ForegroundColor Green
+        $mountedVHD = Mount-VHD -Path $VhdPath -PassThru -ErrorAction Stop
+        $stagingFailure = $null
+        try {
+            $gpuStagingTarget = New-GpuPVTargetFromMountedDisk -VhdPath $VhdPath -DiskNumber $mountedVHD.DiskNumber -CreationOwned
+            Copy-InstallerFilesToVHDX -Target $gpuStagingTarget -Config $script:Config
+        }
+        catch { $stagingFailure = $_; throw }
+        finally {
+            try { Dismount-VHD -Path $VhdPath -ErrorAction Stop }
+            catch {
+                if ($null -ne $stagingFailure) { Write-Warning "Staging VHD cleanup also failed: $($_.Exception.Message)" }
+                else { throw }
+            }
+        }
+        Write-Host "INFO   : Installer files copied to VHDX." -ForegroundColor Green
+    }
+
     if (Test-Path $vhdPath) {
-        New-VM -Name $VMName -MemoryStartupBytes $MemoryAmount -VHDPath $VhdPath -Generation 2 -SwitchName $NetworkSwitch -Version $MaxAvailableVersion | Out-Null
-        Set-VM -Name $VMName -ProcessorCount $CPUCores -CheckpointType Disabled -LowMemoryMappedIoSpace 1GB -HighMemoryMappedIoSpace 32GB -GuestControlledCacheTypes $true -AutomaticStopAction Save
-        Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $false 
+        if ($MaxAvailableVersion) {
+            $createdVM = New-VM -Name $VMName -MemoryStartupBytes $MemoryAmount -VHDPath $VhdPath -Generation 2 -SwitchName $NetworkSwitch -Version $MaxAvailableVersion -ErrorAction Stop
+        } else {
+            # Could not determine a supported VM version; fall back to the default / 无法确定支持的 VM 版本，回退到默认值
+            $createdVM = New-VM -Name $VMName -MemoryStartupBytes $MemoryAmount -VHDPath $VhdPath -Generation 2 -SwitchName $NetworkSwitch -ErrorAction Stop
+            Write-Warning "Could not determine a supported VM version; using default. / 无法确定支持的 VM 版本，使用默认值。"
+        }
+        $createdVM = Resolve-NewVmIdentity -VMName $VMName -VMId ([string]$createdVM.VMId)
+        $script:Config.TargetVMId = [string]$createdVM.VMId
+        Set-VM -VM $createdVM -ProcessorCount $CPUCores -CheckpointType Disabled -LowMemoryMappedIoSpace 1GB -HighMemoryMappedIoSpace 32GB -GuestControlledCacheTypes $true -AutomaticStopAction Save -ErrorAction Stop
+        Set-VMMemory -VM $createdVM -DynamicMemoryEnabled $false -ErrorAction Stop 
         $CPUManufacturer = Get-CimInstance -ClassName Win32_Processor | Foreach-Object Manufacturer
         $BuildVer = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
         if (($BuildVer.CurrentBuild -lt 22000) -and ($CPUManufacturer -eq "AuthenticAMD")) {
             }
         Else {
-            Set-VMProcessor -VMName $VMName -ExposeVirtualizationExtensions $true
+            Set-VMProcessor -VM $createdVM -ExposeVirtualizationExtensions $true -ErrorAction Stop
             }
-        Set-VMHost -ComputerName $ENV:Computername -EnableEnhancedSessionMode $false
-        Set-VMKeyProtector -VMName $VMName -NewLocalKeyProtector
-        Enable-VMTPM -VMName $VMName
-        Assign-VMGPUPartitionAdapter -GPUName $GPUName -VMName $VMName -GPUResourceAllocationPercentage $GPUResourceAllocationPercentage
-        Write-Host "INFO   : Starting and connecting to VM"
-        vmconnect localhost $VMName
+        # Do not alter host-wide enhanced session policy for a single VM task.
+        Set-VMKeyProtector -VM $createdVM -NewLocalKeyProtector -ErrorAction Stop
+        Enable-VMTPM -VM $createdVM -ErrorAction Stop
+        # The shared GPU helper currently accepts a name. Revalidate immediately before it.
+        $null = Resolve-NewVmIdentity -VMName $VMName -VMId $script:Config.TargetVMId
+        Assign-VMGPUPartitionAdapter -GPUName $GPUName -VMName $VMName -GPUResourceAllocationPercentage $GPUResourceAllocationPercentage -AllocationPolicy $GPUAllocationPolicy
+        $null = Resolve-NewVmIdentity -VMName $VMName -VMId $script:Config.TargetVMId
+        Write-Host 'VM configuration complete. Phase4 starts the saved target; open its console manually if needed.'
         }
     else {
-    SmartExit -ExitReason "Failed to create VHDX, stopping script"
+    throw "Finalized VHD disappeared before VM creation; stopped."
     }
 }
 
-Check-Params @params
+# ============================================================================
+# Main Execution Flow / 主执行流程
+# ============================================================================
 
-New-GPUEnabledVM @params
-
-Start-VM -Name $params.VMName
-
-# Define messages for Parsec and non-Parsec scenarios
-$parsecparsecvdaMessage = @"
-If all went well the Virtual Machine will have started.
-In a few minutes it will load the Windows desktop.
-When it does, sign into Parsec (a fast remote desktop app), switch
-the display to the ParsecVDA using the shortcut on the desktop
-and connect to the machine using Parsec from another computer.
-Have fun!
-Sign up to Parsec at https://parsec.app
-"@
-
-$parsecvddMessage = @"
-If all went well the Virtual Machine will have started.
-In a few minutes it will load the Windows desktop.
-When it does, sign into Parsec (a fast remote desktop app), switch
-the display to the Virtual Display using the shortcut on the desktop
-and connect to the machine using Parsec from another computer.
-Have fun!
-Sign up to Parsec at https://parsec.app
-"@
-
-$sunshinevddMessage = @"
-If all went well the Virtual Machine will have started.
-In a few minutes it will load the Windows desktop.
-You can set up Sunshine now. You can find it under the
-hidden icons in the taskbar. When you are ready, switch
-the display to the Virtual Display by clicking the shortcut
-on the desktop and connect to the machine using Moonlight.
-Have fun!
-"@
-
-$sunshineparsecvdaMessage = @"
-If all went well the Virtual Machine will have started.
-In a few minutes it will load the Windows desktop.
-You can set up Sunshine now. You can find it under the
-hidden icons in the taskbar. When you are ready, switch
-the display to the ParsecVDA by clicking the shortcut
-on the desktop and connect to the machine using Moonlight.
-Have fun!
-"@
-
-$justgpupvMessage = @"
-If all went well the Virtual Machine will have started.
-In a few minutes it will load the Windows desktop.
-Your Virtual Machine now has access to your GPU!
-Have fun!
-"@
-
-# Select the appropriate message based on the value of $Parsec
-if ($params.Parsec -and $params.ParsecVDA) {
-    $exitReason = $parsecparsecvdaMessage
-} elseif ($params.Parsec -and $params.VirtualDisplayDriver) {
-    $exitReason = $parsecvddMessage
-} elseif ($params.Sunshine -and $params.VirtualDisplayDriver) {
-    $exitReason = $sunshinevddMessage
-} elseif ($params.Sunshine -and $params.ParsecVDA) {
-    $exitReason = $sunshineparsecvdaMessage
+# Transcripts are not enabled automatically: credential prompts and native command
+# errors must not create an unreviewed secret-bearing transcript.
+if ($Interactive) {
+    $taskName = $TargetVMName
+    if ([string]::IsNullOrWhiteSpace($taskName)) { $taskName = Read-Host 'Target VM name (choose before loading state)' }
+    $stateFile = Get-StateFilePath -VMName $taskName -Prefix 'NewVm' -ScriptRoot $PSScriptRoot
+    $savedState = $null
+    if (-not $ResetState) { $savedState = Import-State -StateFilePath $stateFile -ExpectedVMName $taskName }
+    if ($savedState -and (Read-Host 'Resume this task? Y=resume; N=new configuration') -eq 'Y') {
+        $script:Config = $savedState
+        Set-NewVmAllocationPolicy
+        if ($null -ne $script:RequestedGpuAllocationPolicy) {
+            $requested = $script:RequestedGpuAllocationPolicy
+            $saved = $script:Config.GPUAllocationPolicy
+            if ($requested.Count -ne $saved.Count) { throw 'Requested GPU allocation differs from the checkpoint. Resume preserves it; use the quota-only entry for a completed VM.' }
+            foreach ($field in $requested.Keys) { if ($requested[$field] -cne $saved[$field]) { throw 'Requested GPU allocation differs from the checkpoint. Resume preserves it; use the quota-only entry for a completed VM.' } }
+        }
+        Write-Host ('Resuming saved GPU allocation: ' + (Format-GpuPVAllocationPolicy -Policy $script:Config.GPUAllocationPolicy))
+    } else {
+        Invoke-ConfigWizard -KnownVMName $taskName
+        $script:Config.PhaseCompleted = @()
+    }
+    Sync-ConfigToParams
 } else {
-    $exitReason = $justgpupvMessage
+    # Preserve the editable legacy parameters, but use the checked host-download executor.
+    if ($TargetVMName) { $params.VMName = $TargetVMName }
+    foreach ($key in @($script:Config.Keys)) { if ($params.ContainsKey($key)) { $script:Config[$key] = $params[$key] } }
+    if ($null -ne $script:RequestedGpuAllocationPolicy) { $script:Config.GPUAllocationPolicy = $script:RequestedGpuAllocationPolicy }
+    Set-NewVmAllocationPolicy
+    $script:Config.StreamingChoice = if ($params.Parsec -and $params.ParsecVDA) {'Parsec+ParsecVDA'} elseif ($params.Parsec -and $params.VirtualDisplayDriver) {'Parsec+VDD'} elseif ($params.Sunshine -and $params.ParsecVDA) {'Sunshine+ParsecVDA'} elseif ($params.Sunshine -and $params.VirtualDisplayDriver) {'Sunshine+VDD'} elseif (-not ($params.Parsec -or $params.ParsecVDA -or $params.Sunshine -or $params.VirtualDisplayDriver)) {'None'} else {throw 'Invalid streaming combination.'}
+    $script:Config.SecurityModel = 'HostDownload'
+    $stateFile = Get-StateFilePath -VMName $params.VMName -Prefix 'NewVm' -ScriptRoot $PSScriptRoot
+    if ((Test-Path -LiteralPath $stateFile) -and -not $ResetState) { throw 'A checkpoint exists. Use -Interactive -TargetVMName to resume, or explicitly -ResetState for new configuration.' }
+}
+$securityModel = $script:Config.SecurityModel
+if ($securityModel -ne 'HostDownload') { throw 'Legacy guest-download deployment is not a supported checked path. Choose HostDownload; legacy files are retained for reference.' }
+if ($script:Config.Team_ID -or $script:Config.Key) { throw 'Automatic Parsec Teams enrollment is not supported; configure it manually after installation. No key has been saved.' }
+if ([string]::IsNullOrWhiteSpace([string]$script:Config.Password)) { $script:Config.Password = Read-GpuPVSecret -Prompt 'Windows password (required again after resume; never stored in state)' }
+if ([string]::IsNullOrWhiteSpace([string]$script:Config.Password)) { throw 'A nonempty Windows password is required.' }
+Sync-ConfigToParams
+if ($StartFromStep) {
+    $remaining = @(Get-GpuPVRemainingPhases -Config $script:Config -StartFromStep $StartFromStep)
+    $script:Config.PhaseCompleted = @($script:Config.PhaseCompleted | Where-Object { $remaining -notcontains $_ })
+}
+Save-State -Config $script:Config -StateFilePath $stateFile
+
+# --- Phase 1: Parameter Validation / 阶段 1: 参数验证 ---
+if (-not (Test-StepCompleted -Step "Phase1" -Config $script:Config)) {
+    Write-StepHeader -StepNumber "1" -EnTitle "Parameter Validation" -ZhTitle "参数验证"
+    Check-Params @params
+    Add-PhaseCompleted -Step "Phase1" -Config $script:Config -StateFilePath $stateFile
+} else {
+    Write-Bilingual -En "Phase 1 already completed. Skipping." -Zh "阶段 1 已完成，跳过。"
 }
 
-# Call the SmartExit function with the selected message
-SmartExit -ExitReason $exitReason
+# --- Phase 2: Host File Preparation (HostDownload only) / 阶段 2: 宿主机文件准备（仅 HostDownload）---
+if ($securityModel -eq "HostDownload" -and -not (Test-StepCompleted -Step "Phase2" -Config $script:Config)) {
+    Write-StepHeader -StepNumber "2" -EnTitle "Host File Preparation" -ZhTitle "宿主机文件准备"
+    Invoke-HostFilePreparation -Config $script:Config
+    Sync-ConfigToParams  # Re-sync after file paths are populated
+    Add-PhaseCompleted -Step "Phase2" -Config $script:Config -StateFilePath $stateFile
+} elseif ($securityModel -eq "HostDownload") {
+    Write-Bilingual -En "Phase 2 already completed. Skipping." -Zh "阶段 2 已完成，跳过。"
+}
+
+# --- Phase 3: VHDX Creation / 阶段 3: VHDX 创建 ---
+if (-not (Test-StepCompleted -Step "Phase3" -Config $script:Config)) {
+    Write-StepHeader -StepNumber "3" -EnTitle "VHDX Creation" -ZhTitle "VHDX 创建"
+    New-GPUEnabledVM @params -SecurityModel $securityModel
+    Add-PhaseCompleted -Step "Phase3" -Config $script:Config -StateFilePath $stateFile
+} else {
+    Write-Bilingual -En "Phase 3 already completed. Skipping." -Zh "阶段 3 已完成，跳过。"
+}
+
+$currentTarget = Resolve-NewVmIdentity -VMName $params.VMName -VMId $script:Config.TargetVMId
+
+# --- Phase 4: VM Startup / 阶段 4: 虚拟机启动 ---
+if (-not (Test-StepCompleted -Step "Phase4" -Config $script:Config)) {
+    Write-StepHeader -StepNumber "4" -EnTitle "VM Startup" -ZhTitle "虚拟机启动"
+    Start-NewVmTarget -VMName $params.VMName -VMId $script:Config.TargetVMId
+    Add-PhaseCompleted -Step "Phase4" -Config $script:Config -StateFilePath $stateFile
+} else {
+    Write-Bilingual -En "Phase 4 already completed. Skipping." -Zh "阶段 4 已完成，跳过。"
+}
+
+# Readiness and credentials are runtime prerequisites on every pending resume.
+$securePassword = ConvertTo-SecureString -String $params.Password -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($params.Username, $securePassword)
+Invoke-GpuPVPostBootWorkflow -Config $script:Config -WaitReady {
+    Invoke-Phase5_WaitForVM -VMName $params.VMName -VMId $script:Config.TargetVMId -Credential $credential -TimeoutSeconds 300
+} -Install {
+    Invoke-Phase6_PostBootInstall -VMName $params.VMName -VMId $script:Config.TargetVMId -Credential $credential
+} -Verify {
+    Invoke-Phase7_VerifyAndOutput -VMName $params.VMName -Config $script:Config -Credential $credential
+} -SavePhase {
+    param($step)
+    Add-PhaseCompleted -Step $step -Config $script:Config -StateFilePath $stateFile
+}
+Write-Host 'Checked phases completed. Checkpoint retained for audit; client login and image quality remain manual acceptance tasks.'

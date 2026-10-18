@@ -3,9 +3,16 @@ $team_id,
 $key
 )
 
-while(!(Test-NetConnection Google.com).PingSucceeded){
+# Load local installer paths if available / 加载本地安装程序路径（如果可用）
+$localPathsFile = "C:\ProgramData\Easy-GPU-P\LocalInstallers\LocalPaths.ps1"
+if (Test-Path $localPathsFile) { . $localPathsFile }
+
+$netRetry = 0; $netMaxRetry = 60
+while(!(Test-NetConnection Google.com).PingSucceeded -and $netRetry -lt $netMaxRetry){
     Start-Sleep -Seconds 1
-    }
+    $netRetry++
+}
+if ($netRetry -ge $netMaxRetry) { Write-Warning "Network check timeout. Continuing anyway..." }
 
 Get-ChildItem -Path C:\ProgramData\Easy-GPU-P -Recurse | Unblock-File
 
@@ -154,3 +161,18 @@ Function Remove-LogonScript {
 
 # Remove the logon script entry to prevent further executions
 Remove-LogonScript
+
+# Remove the Run key entry used by ExistingVM installation / 移除 ExistingVM 安装使用的 Run 键项
+try {
+    Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "EasyGPUPVExistingInstall" -ErrorAction SilentlyContinue
+} catch {}
+
+# Restore PowerShell ExecutionPolicy to system default / 恢复 PowerShell 执行策略为系统默认值
+try {
+    Remove-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell" -Name "ExecutionPolicy" -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell" -Name "EnableScripts" -ErrorAction SilentlyContinue
+    Write-Host "INFO   : PowerShell ExecutionPolicy restored to default. / PowerShell 执行策略已恢复为默认值。"
+}
+catch {
+    Write-Warning "Could not restore PowerShell ExecutionPolicy: $_ / 无法恢复 PowerShell 执行策略: $_"
+}

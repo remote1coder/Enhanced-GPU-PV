@@ -5,48 +5,48 @@ Remember: GPU Name must match the name of the GPU you assigned when creating the
 Param (
 [string]$VMName = "NameofyourVM",
 [string]$GPUName = "NameofyourGPU",
-[string]$Hostname = $ENV:Computername
+[string]$Hostname = $ENV:Computername,
+[string]$SystemVhdPath,
+[ValidateRange(0,2147483647)][int]$SystemPartitionNumber = 0
 )
 
 #>
 
 Param (
 [string]$VMName,
-[string]$GPUName,
-[string]$Hostname = $ENV:Computername
+[string]$GPUName = "AUTO",
+[string]$Hostname = $ENV:Computername,
+[string]$SystemVhdPath,
+[ValidateRange(0,2147483647)][int]$SystemPartitionNumber = 0
 )
 
-Import-Module $PSSCriptRoot\Add-VMGpuPartitionAdapterFiles.psm1
+Import-Module $PSScriptRoot\Add-VMGpuPartitionAdapterFiles.psm1
+Import-Module $PSScriptRoot\GpuPV-TargetSafety.psm1 -ErrorAction Stop
 
-$VM = Get-VM -VMName $VMName
-$VHD = Get-VHD -VMId $VM.VMId
+$VM = Get-GpuPVExactVM -Name $VMName
+if (-not $VM) {
+    Write-Error "VM '$VMName' not found."
+    return
+}
+# Resolve attachment ambiguity before any shutdown or writable mount.
+$selectedDisk = Select-GpuPVAttachedDisk -Disks @(Get-VMHardDiskDrive -VM $VM -ErrorAction Stop) -VhdPath $SystemVhdPath
 
-If ($VM.state -eq "Running") {
-    [bool]$state_was_running = $true
+# Preserve the original state; saved/paused VMs are never discarded by an update.
+$originalState = $VM.State
+$VM = Stop-GpuPVVMForOfflineAccess -VM $VM
+
+Write-Host "Opening the verified offline Windows target..."
+$target = Open-GpuPVOfflineTarget -VM (Get-VM -Id $VM.VMId -ErrorAction Stop) -VhdPath $selectedDisk.Path -PartitionNumber $SystemPartitionNumber
+try {
+    Add-VMGpuPartitionAdapterFiles -hostname $Hostname -Target $target -GPUName $GPUName -ErrorAction Stop
+}
+finally {
+    Close-GpuPVOfflineTarget -Target $target
+}
+
+If ($originalState -eq "Running"){
+    Write-Host "Previous State was running so starting VM..."
+    Start-VM -VM (Get-VM -Id $VM.VMId -ErrorAction Stop) -ErrorAction Stop
     }
 
-if ($VM.state -ne "Off"){
-    "Attemping to shutdown VM..."
-    Stop-VM -Name $VMName -Force
-    } 
-
-While ($VM.State -ne "Off") {
-    Start-Sleep -s 3
-    "Waiting for VM to shutdown - make sure there are no unsaved documents..."
-    }
-
-"Mounting Drive..."
-$DriveLetter = (Mount-VHD -Path $VHD.Path -PassThru | Get-Disk | Get-Partition | Get-Volume | Where-Object {$_.DriveLetter} | ForEach-Object DriveLetter)
-
-"Copying GPU Files - this could take a while..."
-Add-VMGPUPartitionAdapterFiles -hostname $Hostname -DriveLetter $DriveLetter -GPUName $GPUName
-
-"Dismounting Drive..."
-Dismount-VHD -Path $VHD.Path
-
-If ($state_was_running){
-    "Previous State was running so starting VM..."
-    Start-VM $VMName
-    }
-
-"Done..."
+Write-Host "Done..."

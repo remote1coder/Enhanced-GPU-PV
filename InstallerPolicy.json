@@ -1,0 +1,67 @@
+{
+  "SchemaVersion": 1,
+  "VerifiedDate": "2026-10-12",
+  "Evidence": "Version-pinned hashes from GitHub release metadata, Microsoft WinGet manifests, or explicitly labelled direct HTTPS publisher artifact measurements. Hash identity is not a malware-free guarantee.",
+  "Components": {
+    "Sunshine": {
+      "Version": "v2026.914.233613",
+      "FileName": "Sunshine-Windows-AMD64-installer.msi",
+      "Url": "https://github.com/LizardByte/Sunshine/releases/download/v2026.914.233613/Sunshine-Windows-AMD64-installer.msi",
+      "Sha256": "1d7fed8beecd5889dc7ff14cf9f42d6d38f37c3066c13c6c2a5f4e91847e0ccf",
+      "Size": 33710080
+    },
+    "VDD": {
+      "Version": "25.7.23",
+      "FileName": "VirtualDisplayDriver-x86.Driver.Only.zip",
+      "Url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip",
+      "Sha256": "e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a",
+      "Size": 132118
+    },
+    "Virtual Audio Driver": {
+      "Version": "25.7.23",
+      "FileName": "VirtualAudioDriver.zip",
+      "Url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualAudioDriver-x86.Driver.Only.zip",
+      "Sha256": "ad5c773deabe850fac89bafb4a62ded266fe6069aa07fc6f61c154e7fcb1a825",
+      "Size": 51004
+    },
+    "NefCon": {
+      "Version": "v1.17.40",
+      "FileName": "nefcon_v1.17.40.zip",
+      "Url": "https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip",
+      "Sha256": "812bae7ed7dfb7d6d2284bc7de2f8ccebc92ed2a0b1ae893c53b337096e50c1a",
+      "Size": 2233160
+    },
+    "ParsecVDA": {
+      "Version": "v1.4.1",
+      "FileName": "ParsecVDA.-.Always.Connected-v1.4.1-setup-x64.exe",
+      "Url": "https://github.com/timminator/ParsecVDA-Always-Connected/releases/download/v1.4.1/ParsecVDA.-.Always.Connected-v1.4.1-setup-x64.exe",
+      "Sha256": "76f25589cca93f8e98c3d0782bb7d4225440cbd996796061895093a060ffd3f3",
+      "Size": 8239840,
+      "VerificationSource": "SHA256 computed from direct HTTPS publisher/release download held only in memory; no independent publisher checksum available; no executable saved or run"
+    },
+    "Parsec": {
+      "Version": "150.104.1.0",
+      "FileName": "parsec-windows.exe",
+      "Url": "https://builds.parsec.app/package/parsec-windows.exe",
+      "Sha256": "b8a9cd519010666def0ef6e119eb42b33b5b811216f34e4f6c8e2e25ac290fbc",
+      "Size": 0,
+      "VerificationSource": "microsoft/winget-pkgs Parsec.Parsec.installer.yaml; manifest snapshot in audit evidence"
+    },
+    "VB-Cable": {
+      "Version": "Pack43",
+      "FileName": "VBCable.zip",
+      "Url": "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip",
+      "Sha256": "66fd0a4d9f4896ff41632b7e3d53892c085c4561f53e8ae8d0f0bc10eedd1cdd",
+      "Size": 1139147,
+      "VerificationSource": "SHA256 computed from direct HTTPS publisher/release download held only in memory; no independent publisher checksum available; no executable saved or run"
+    },
+    "VC++ Redist": {
+      "Version": "14.51.36247.0",
+      "FileName": "vc_redist.x64.exe",
+      "Url": "https://download.visualstudio.microsoft.com/download/pr/ebdab8e5-1d7b-4d9f-a11b-cbb1720c3b12/843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C/VC_redist.x64.exe",
+      "Sha256": "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c",
+      "Size": 0,
+      "VerificationSource": "microsoft/winget-pkgs Microsoft.VCRedist.2015+.x64.installer.yaml; manifest snapshot in audit evidence"
+    }
+  }
+}

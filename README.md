@@ -1,85 +1,311 @@
 # Enhanced-GPU-PV
 
-Windows PowerShell automation for Hyper-V GPU partitioning, virtual displays, Parsec or Sunshine and optional virtual audio. Based on Easy-GPU-PV; GPL v3.
+Windows PowerShell automation for Hyper-V GPU partitioning (GPU-PV), virtual displays,
+Parsec or Sunshine streaming and optional virtual audio. Based on Easy-GPU-PV; GPL v3.
 
-This revision was checked with PowerShell 5.1 parsing and isolated tests. It has not been run against Hyper-V, a guest installer or a streaming client during this repair. The repair workstation must not be used for these operations.
+Everything below describes this revision only. Execution paths that are kept as
+historical source (for example `Configure-GpuPV-ExistingVM-Archive-Original.ps1`) are
+not supported entrypoints and must not be launched as a fallback.
 
-## Current paths
+## Requirements
 
-| Entry | Behavior |
+| Requirement | Details |
 |---|---|
-| CopyFilesToVM.ps1 | New VM from ISO with sources/install.wim, or direct WIM; HostDownload only; ESD-only media is rejected |
-| Configure-GpuPV-ExistingVM.ps1 | Full existing-VM configuration, explicit resume/restart/rerun |
-| Configure-GpuPV-ExistingVM-SecureNote.ps1 | Thin wrapper around the same core |
-| Enhanced-GPU-PV.ps1 | Menu; option 5 runs full ExistingVM configuration; option 9 changes GPU quotas only |
-| Set-GpuPVAllocation.ps1 | Quota-only change on an already Off VM with one existing adapter; no driver/deployment work |
-| Update-VMGpuPartitionDriver.ps1 | Driver refresh through the identity-bound offline target |
-| VMScripts/PostBoot-Installer.ps1 | Shared guest installer and independent VerifyOnly checks |
-| VMScripts/Activate-VDD.ps1 | Manual VDD activation without forced restart |
+| Host | Windows 10 or 11 Pro / Enterprise / Education with the Hyper-V role enabled |
+| Host build | Windows build 19041 or later; the existing-VM workflow checks this |
+| VM version | VM configuration version 8.0 or later for existing-VM workflows |
+| Shell | Windows PowerShell 5.1 (supported and tested), 64-bit, started with **Run as Administrator** |
+| GPU | Vendor driver installed on the host and returned by `Get-VMHostPartitionableGpu` |
+| Install media | ISO containing `sources/install.wim`, or a `.wim` file. ESD-only media is rejected |
+| Network | Host internet access while packages are staged; an external switch for the guest |
+| Disk | Free space for the new VHD, plus the staged packages |
 
-Archive-Original and the old User/VMScripts guest-download scripts remain executable historical source. They are not repaired supported entrypoints and must not be launched as a fallback. Templates may be under User/User; they were not moved. SecureNote is not an antivirus exemption. Do not disable antivirus or expand exclusions to make a rejected action proceed.
+Check the host before starting:
 
-## GPU allocation inputs
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Select-Object State
+Get-VMHostPartitionableGpu | Select-Object Name
+```
 
-GPU allocation defaults to 50 percent across supported entrypoints and the internal helper. Interactive prompts accept `70` or `70%`, retry invalid input, and use 50 only for blank input. Entering `4GiB` sets VRAM bytes and then asks compute, encode and decode percentages separately. Menu option 9 changes quotas on an existing adapter without rerunning deployment; the VM must already be Off. Read [GPU_ALLOCATION.md](GPU_ALLOCATION.md) for CLI arguments, exact state encoding, resume behavior and verification limits.
+`State` must be `Enabled` and your GPU must be listed. If the list is empty, fix the GPU
+driver or the Hyper-V configuration first; no script in this repository can work around it.
 
-The allocation update passed 65 PowerShell 5.1 parser/structure checks. Behavior suites remain pending after a PowerShell AMSI compilation crash; this is not runtime acceptance. Its audit is E:\codex\_gpu_allocation_20261015. Earlier test totals below belong to earlier source revisions.
+## Quick start
 
-## Choices and packages
+```powershell
+Set-Location "C:\path\to\Enhanced-GPU-PV"
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\Enhanced-GPU-PV.ps1
+```
 
-StreamingChoice: None, Parsec+ParsecVDA, Parsec+VDD, Sunshine+ParsecVDA or Sunshine+VDD. AudioDriver: None, VBCable or VirtualAudioDriver. Sunshine+ParsecVDA does not install the Parsec streaming app. Current VDD configuration supports one monitor.
+## Menu
 
-Every active path prepares packages on the host, checks hashes, copies them into a checked guest volume, and verifies the exact manifest again inside the guest. VMDownload is rejected. Configure Parsec accounts/Teams and Sunshine first-run accounts manually in their applications; automatic Teams enrollment is unsupported. A running service does not prove login or streaming.
+`Enhanced-GPU-PV.ps1` is the entrypoint. Options 1, 4, 5, 7 and 9 map to standalone
+scripts; options 2, 3 and 6 are implemented inside the menu script.
 
-| Package | Pinned version | Hash source |
+| Option | Action | Script |
 |---|---|---|
-| Sunshine | v2026.914.233613, MSI | GitHub release asset digest |
-| VDD / Virtual Audio Driver | 25.7.23 | GitHub release asset digest |
-| NefCon | v1.17.40 | GitHub release asset digest |
-| Parsec | 150.104.1.0 | Microsoft WinGet manifest |
-| VC++ x64 runtime | 14.51.36247.0 | Microsoft WinGet manifest |
-| ParsecVDA Always Connected | v1.4.1 | Direct HTTPS release bytes measured on 2026-10-12 |
-| VB-Cable | Pack43 | Direct HTTPS vendor bytes measured on 2026-10-12 |
+| 1 | Create a new GPU-PV VM | `CopyFilesToVM.ps1` |
+| 2 | Add GPU-PV to an existing VM | `Enhanced-GPU-PV.ps1` internal |
+| 3 | Remove GPU-PV from an existing VM | `Enhanced-GPU-PV.ps1` internal |
+| 4 | Update GPU drivers in an existing VM | `Update-VMGpuPartitionDriver.ps1` |
+| 5 | Full existing-VM configuration | `Configure-GpuPV-ExistingVM.ps1` |
+| 6 | Enable RDP on an existing VM | `Enhanced-GPU-PV.ps1` internal |
+| 7 | Run host compatibility checks | `PreChecks.ps1` |
+| 8 | Exit | - |
+| 9 | Change GPU quota only (VM must be Off) | `Set-GpuPVAllocation.ps1` |
 
-InstallerPolicy.json records the exact sources and hashes. The last two are locally computed hashes of upstream downloads, not independently published checksums or malware-free guarantees. Pack43 is retained to avoid an untested installer upgrade; VB-Audio also publishes Pack45. Parsec uses a mutable vendor URL: an upstream replacement will fail the pinned hash check. Review and update the policy deliberately instead of disabling verification. No downloaded program was executed during this audit.
+Options 2 and 3 stop a running VM gracefully and start it again afterwards; option 4 does
+the same for the offline driver copy, and option 6 starts a stopped VM or resumes a paused
+one and leaves it running. Offline options refuse a `Saved`, `Paused` or transitioning VM
+with an explicit error; resolve its state manually first. No option forces a shutdown.
 
-## Recovery
+## 1. Create a new VM
 
-State schema 2 binds an entrypoint and target. ExistingVM uses the exact VM name and GUID. NewVM determines the name before state lookup and records the GUID after creation. A different VM reusing a name is rejected. ExistingVM now also persists the selected VHD, disk, partition and volume identity before offline mutation. A saved Phase 3 or later without that binding is rejected: preserve the old state and explicitly ResetState on a suitable host. ResetState restarts the workflow; it is not a rollback. Legacy state may contain secrets; it is neither silently loaded nor deleted.
+Option 1 offers two modes.
 
-- Resume continues pending phases and reacquires runtime credentials/readiness.
-- ResetState uses current configuration; it does not undo previous VM changes.
-- ExistingVM StartFromStep accepts 1–7; 0 means normal resume. Rerunning invalidates the chosen phase and its downstream phases, and requires earlier successful phases.
-- NewVM StartFromStep accepts Phase1–Phase7. A partially created VM is not automatically deleted or adopted; inspect it on an authorized host before recovering.
-- Failed installation, missing components and restart-required results leave completion pending. A restart is an explicit operator action on an authorized host.
-- Completion state is retained. Manual client acceptance remains separate.
+**Interactive wizard (recommended).** It walks through VM basics (name, install media,
+edition, virtual disk, memory, CPU count, switch), GPU configuration, streaming software,
+installer sources, Sunshine and virtual display settings, connection method and the guest
+account, then runs the deployment. No file editing is required.
 
-State uses a non-secret allowlist, explicit UTF-8 decoding, typed configuration validation and atomic writes. NewVM completed phases must form a contiguous prefix with the VM GUID present after creation. The source autounattend.xml is preserved; a temporary host copy is deleted in finally. Windows setup still needs a provisioning credential in the guest answer file; manage that account and guest setup artifacts appropriately. No automatic transcript is enabled.
+**Legacy mode.** Edit the `$params` block at the top of `CopyFilesToVM.ps1`, then choose
+mode 2. The block supplies the configuration; the allocation switches still override it.
 
-## Storage, switches and RDP
+Key parameters:
 
-Multiple attached disks require an explicit SystemVhdPath; multiple candidate Windows partitions require SystemPartitionNumber. VM/VHD/disk/partition/volume identities are checked together. Missing access paths, host volumes, identity changes and reparse traversal are rejected. Disk identity is checked again before releasing an owned mount. If a successful mount cannot be identified, it is left for manual inspection rather than detached by a guessed disk number. Driver functions require that checked target rather than a drive letter. Saved/paused VMs are refused for offline driver changes; shutdown is graceful. TimeoutSeconds limits follow-up polling, not the synchronous Stop-VM call itself.
+| Key | Meaning |
+|---|---|
+| `VMName` | Must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` - no spaces, because it names the checkpoint file |
+| `SourcePath` | ISO or WIM to install from |
+| `Edition` | Image index (1-based) or image name, for example `6` or `Professional` |
+| `VhdFormat` | `VHD`, `VHDX` or `AUTO` |
+| `DiskLayout` | `BIOS`, `UEFI` or `WindowsToGo` |
+| `SizeBytes` / `MemoryAmount` / `CPUCores` | Virtual hardware sizing |
+| `NetworkSwitch` | External switch, for example `Default Switch` |
+| `VHDPath` | Must already exist; the script refuses a missing directory |
+| `UnattendPath` | Defaults to `autounattend.xml` in the repository |
+| `GPUName` | `AUTO` or the exact host GPU name |
+| `GPUResourceAllocationPercentage` | Legacy percentage form; default `50` |
+| `Username` / `Password` / `Autologon` | Guest account created by the answer file |
 
-SkipCleanup still stages required installers. SkipGpuDriverUpdate suppresses GPU-driver cleanup/copy, not every VM setting. ExistingVM Auto disables RDP connections; KeepRdp enables the checked rule for the configured port. NewVM display policy does not itself certify RDP connection policy. Menu option 6 reports local listener/rule observations; remote login is unverified.
+`Team_ID` and `Key` are rejected: automatic Parsec Teams enrollment is unsupported.
+Configure Teams manually inside the Parsec application after installation.
 
-## Later real-host acceptance
+Streaming and audio combinations:
 
-Use Windows PowerShell 5.1 and an appropriate Windows/Hyper-V installation, compatible GPU drivers, administrator access and a recoverable disposable test VM. This repair does not certify hardware/OS combinations. PreChecks runs real host queries and is not an isolated test.
+| `Parsec` | `ParsecVDA` | `Sunshine` | `VirtualDisplayDriver` | Result |
+|---|---|---|---|---|
+| `$false` | `$false` | `$false` | `$false` | GPU-PV only |
+| `$true` | `$true` | `$false` | `$false` | Parsec + ParsecVDA |
+| `$true` | `$false` | `$false` | `$true` | Parsec + VDD |
+| `$false` | `$false` | `$true` | `$true` | Sunshine + VDD |
+| `$false` | `$true` | `$true` | `$false` | Sunshine + ParsecVDA |
 
-On an authorized suitable host, record host/guest builds, GPU/driver, packages and disk identity; exercise normal installation, controlled resume and fresh verification. Test actual client login, picture, audio, requested HDR and RDP behavior from another machine. Keep failure injection isolated; do not force power loss or kill installers for testing.
+Any other combination throws `Invalid streaming combination`. Sunshine + ParsecVDA does
+not install the Parsec streaming application. The current VDD configuration supports one
+monitor.
 
-ExistingVM PlanOnly/WhatIf emits a plan, not a host inspection. Here only its pure functions and AST ordering were tested; the entrypoint was not run.
+Resume and restart:
 
-See REPAIR_NOTES_20261015.md for the second static repair, evidence and remaining acceptance. REPAIR_NOTES_20261012.md retains the first-round GPU-01 through GPU-15 mapping. Current audit scripts, evidence and backups are under E:\codex\_gpu_repair_20261013; first-round evidence remains under E:\codex\_gpu_repair_20261011. Old CHANGES/EVOLUTION files are historical and may conflict with this revision.
+```powershell
+# Resume an interrupted deployment (keeps the saved allocation policy)
+.\CopyFilesToVM.ps1 -Interactive -TargetVMName "GPUPV"
 
-## Second static repair notes
+# Start over and discard the checkpoint
+.\CopyFilesToVM.ps1 -Interactive -TargetVMName "GPUPV" -ResetState
+```
 
-Conversion errors and failed cleanup stop the workflow. A pre-existing final VHD is never deleted or replaced. ISO mounts are released only by their owner. Failed/unknown WIM or hive cleanup leaves a diagnostic path for inspection; do not recursively delete that path while it may still be mounted. Partial VM creation remains an explicit recovery task.
+In legacy mode a checkpoint causes an error until you pass `-ResetState`. `StartFromStep`
+accepts `Phase1` through `Phase7` for a new VM. A partially created VM is never deleted or
+adopted automatically; inspect it on an authorized host first.
 
-Archive layouts are tied to the pinned versions in InstallerPolicy.json. NefCon, VDD, Virtual Audio and VB-Cable use exact archive members instead of the first matching filename. The VDD package named x86 actually declares NTamd64 in its INF; its filename alone does not select a 32-bit driver. VDD uses the pinned 25.7.23 XML format and one explicitly selected or uniquely healthy guest GPU. A conflicting VDD registry override is reported, not overwritten. Virtual Audio 25.7.23 requires guest build 22000 or later; this pinned VDD's HDR mode requires build 22631 or later. These are package/source checks, not proof of working audio or HDR.
+## 2. Add or remove GPU-PV on an existing VM
 
-Sunshine rules are program-scoped TCP/UDP rules matching the pinned publisher setup. Verification reads the effective firewall rules and filters. Existing conflicting project rules stop verification; unrelated rules and administrator execution policy are preserved. Existing installations may have legacy broad rules; this repair does not identify those rules as owned merely by their display names.
+Options 2 and 3 prompt for the VM name. Option 2 asks for the GPU name and the allocation.
+Option 3 asks for an optional GPU name (empty means safe mode) and offers a deep clean that
+removes residual GPU files left by other hosts. When more than one disk or Windows partition
+is attached, both ask for the exact VHD path and partition number instead of guessing.
 
-A required restart is recorded under the guest installer directory and must be resolved before completion. Keep those records when restaging packages. Unknown/interrupted installer state needs inspection; it must not be erased merely to obtain a green result. See the repair notes for recovery details.
+## 3. Update GPU drivers
 
-Before the allocation update, the second round was a static candidate with incomplete regression: 323 checks passed, while 227 checks remain pending (77 NewVM, 37 reboot-journal, and 113 prior PostBoot checks needing current-revision rerun). Several test processes crashed inside AMSI during compilation. The 12 supported PowerShell source files passed PowerShell 5.1 parsing. See REPAIR_NOTES_20261015.md and final_validation.json; this is not real deployment acceptance.
+Option 4, or directly:
+
+```powershell
+.\Update-VMGpuPartitionDriver.ps1 -VMName "GPUPV"
+.\Update-VMGpuPartitionDriver.ps1 -VMName "GPUPV" -GPUName "AUTO" `
+    -SystemVhdPath "D:\Hyper-V\GPUPV\Virtual Hard Disks\GPUPV.vhdx" -SystemPartitionNumber 3
+```
+
+`-VMName` is required. `-SystemVhdPath` and `-SystemPartitionNumber` are only needed when
+the VM has several attached disks or several candidate Windows partitions. The VM must be
+`Off` or `Running`; `Saved` and `Paused` are refused.
+
+## 4. Full existing-VM configuration (option 5)
+
+This is the supported path for changing streaming software, audio driver, GPU settings or
+RDP policy on a VM that already exists.
+
+```powershell
+# Preview the plan without touching the host
+.\Configure-GpuPV-ExistingVM.ps1 -VMName "GPUPV" -PlanOnly
+
+# Full configuration
+.\Configure-GpuPV-ExistingVM.ps1 -VMName "GPUPV" -StreamingChoice "Sunshine+VDD" `
+    -AudioDriver VBCable -ConnectionMethod KeepRdp
+
+# Resume at a specific phase (1-7); 0 means ask
+.\Configure-GpuPV-ExistingVM.ps1 -VMName "GPUPV" -StartFromStep 3
+
+# Discard the checkpoint and use the current parameters
+.\Configure-GpuPV-ExistingVM.ps1 -VMName "GPUPV" -ResetState
+```
+
+`-PlanOnly` and `-WhatIf` return the plan before any VM inspection. A plan is not proof
+that the host is suitable.
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-VMName` | prompted if empty | Exact VM name, no wildcards |
+| `-GPUName` | `AUTO` | Host GPU to assign |
+| `-GPUAllocation` | `50` | Percentage or VRAM size; see below |
+| `-GPUComputePercentage` / `-GPUEncodePercentage` / `-GPUDecodePercentage` | - | Only valid together with a VRAM size |
+| `-AudioDriver` | `VBCable` | `VBCable`, `VirtualAudioDriver` or `None` |
+| `-StreamingChoice` | `None` | `None`, `Parsec+ParsecVDA`, `Parsec+VDD`, `Sunshine+ParsecVDA`, `Sunshine+VDD` |
+| `-ConnectionMethod` | `KeepRdp` | `KeepRdp` enables the checked rule; `Auto` disables RDP connections |
+| `-VDDConfig` | 1 monitor, 1920x1080, 144 Hz, HDR off | Virtual display settings |
+| `-SunshineStreamConfig` | HEVC/AV1 on, HDR off | Sunshine stream settings |
+| `-StartFromStep` | `0` | `0` resumes; `1`-`7` invalidates that phase and all downstream phases |
+| `-ResetState` | off | Restart with current parameters; not a rollback |
+| `-SkipHostChecks` | off | Skips the Hyper-V and build 19041 checks; VM version and state checks still run |
+| `-SkipCleanup` | off | Keep staged packages; required installers are still copied |
+| `-SkipGpuDriverUpdate` | off | Skips GPU driver cleanup and copy; adapter assignment and other settings still run |
+| `-PlanOnly` | off | Emit the plan and return |
+| `-CredentialUserName` / `-CredentialPassword` | prompted | Guest credential for PowerShell Direct; never written to state |
+
+Example with a virtual display and HDR:
+
+```powershell
+.\Configure-GpuPV-ExistingVM.ps1 -VMName "GPUPV" -StreamingChoice "Sunshine+VDD" `
+    -VDDConfig @{MonitorCount=1; Resolution='2560x1440'; RefreshRate=144; EnableHDR=$true}
+```
+
+Rerunning a phase invalidates that phase and its downstream phases, and requires the
+earlier phases to have completed. A saved Phase 3 or later state without the recorded VHD,
+disk, partition and volume identity is rejected; preserve it and use `-ResetState` on a
+suitable host.
+
+`-ForceReinstallVDD` and `-UseLegacyVDD` are accepted for compatibility, but only the
+archived `Configure-GpuPV-ExistingVM-Archive-Original.ps1` implements them. They have no
+effect in this supported entrypoint.
+
+## 5. Enable RDP (option 6)
+
+Prompts for the VM name and guest administrator credentials, starts the VM if needed,
+enables Remote Desktop and the firewall rule for the configured port through PowerShell
+Direct, then reports the port and the effective configuration result.
+
+Only the guest configuration and its local listener are verified. Network reachability,
+other blocking policies and an authorized client login remain manual checks.
+
+## 6. Host compatibility checks (option 7)
+
+Runs `PreChecks.ps1` and reports host build, Hyper-V state, GPU presence and other
+prerequisites. It performs real host queries and changes nothing.
+
+## 7. Change GPU quota only (option 9)
+
+```powershell
+.\Set-GpuPVAllocation.ps1 -VMName "GPUPV" -GPUAllocation "70%"
+.\Set-GpuPVAllocation.ps1 -VMName "GPUPV" -GPUAllocation 4GiB `
+    -GPUComputePercentage 60 -GPUEncodePercentage 40 -GPUDecodePercentage 40
+```
+
+The VM must be `Off` and have exactly one identifiable GPU partition adapter. This
+entrypoint never starts or stops the VM, never adds or removes an adapter, and never
+mounts a disk or stages files. Input is previewed, confirmed, revalidated and read back.
+
+## GPU allocation formats
+
+| Input | Result |
+|---|---|
+| blank | 50 percent |
+| `70` or `70%` | 70 percent of every resource (1-100, dot for decimals) |
+| `4GiB` | VRAM byte count; compute, encode and decode percentages are then asked separately |
+
+Units `B`, `KiB`, `MiB`, `GiB` and `TiB` are accepted. Separate compute/encode/decode
+percentages are rejected unless a VRAM size was given. Resume keeps the policy saved in
+the checkpoint; a different allocation on resume throws instead of being applied.
+
+## State files and recovery
+
+| Workflow | State file |
+|---|---|
+| New VM | `NewVm-<VMName>.state.json` next to the scripts |
+| Existing VM | `.gpupv-existing-v2-<hash>.state.json` next to the scripts |
+
+State is bound to the entrypoint and to the VM identity (name and GUID for an existing VM;
+name first, GUID after creation for a new one). Reusing a name for a different VM is
+rejected. Legacy state files may contain secrets and are neither loaded nor deleted.
+
+- Resume continues pending phases and asks for credentials again.
+- `-ResetState` restarts with the current parameters; it does not undo VM changes.
+- Missing components, a failed installer or a required restart leave completion pending.
+  Resolve it deliberately; do not delete state just to obtain a passing result.
+
+## Troubleshooting
+
+| Message | Cause and fix |
+|---|---|
+| `Administrator privileges required` | Start Windows PowerShell 5.1 as Administrator, 64-bit |
+| `Script not running as Administrator` | Same as above; `CopyFilesToVM.ps1` exits before doing anything |
+| `VHDPath Directory doesn't exist` | Create the directory or change `VHDPath` |
+| `ISO Path Invalid` | `SourcePath` does not exist or points to unsupported media |
+| `This WIM contains multiple images` | Set `Edition` to one index or one image name |
+| `ESD-only` rejection | Use media that contains `sources/install.wim` |
+| `VM name must resolve to one exact VM` | Provide the exact name, without wildcards; duplicate names are refused |
+| `Invalid state identity` | New-VM names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` |
+| `Disk identity is ambiguous or missing` | Pass `-SystemVhdPath`; no first or largest disk fallback is used |
+| `Windows-volume identity is ambiguous or missing` | Pass `-SystemPartitionNumber` for a verified Windows partition |
+| `The selected disk belongs to the running host` | The chosen VHD resolves to a host disk; select the attached VM disk |
+| `Saved, paused or transitioning VM requires an explicit owner decision` | Resume or shut down the VM manually; no force shutdown is performed |
+| `Refusing to replace existing VHD` | Choose a new VM name or VHD path; existing VHDs are never overwritten |
+| `No trusted SHA256 pin for ...` | The package version changed upstream; update `InstallerPolicy.json` deliberately |
+| Hash mismatch during staging | Package bytes differ from the pinned hash; do not disable verification |
+| `A checkpoint exists` | Resume with `-Interactive -TargetVMName`, or pass `-ResetState` |
+| RDP test fails | The VM must be running and the guest credential must work through PowerShell Direct |
+
+## Packages
+
+Versions and hashes are pinned in `InstallerPolicy.json`. That file is the source of truth;
+the table is a summary.
+
+| Package | Pinned version |
+|---|---|
+| Sunshine | v2026.914.233613 (MSI) |
+| Virtual Display Driver / Virtual Audio Driver | 25.7.23 |
+| NefCon | v1.17.40 |
+| Parsec | 150.104.1.0 |
+| VC++ x64 runtime | 14.51.36247.0 |
+| ParsecVDA Always Connected | v1.4.1 |
+| VB-Cable | Pack43 |
+
+Packages are staged on the host, hash-checked, copied into a checked guest volume and
+verified again inside the guest. `VMDownload` (guest-side download) is rejected. A running
+service does not prove that a client is logged in or that streaming works.
+
+## Verification status
+
+This revision is a static repair. The PowerShell sources pass PowerShell 5.1 parsing and
+isolated checks; the allocation update passed 65 parser and structure checks. Behavior
+suites are incomplete after an AMSI compilation crash, and nothing here certifies a real
+Hyper-V deployment, a guest installer, HDR, audio or remote login.
+
+Treat the first run on real hardware as an acceptance test on a disposable VM: record host
+and guest builds, GPU driver version, package versions and disk identity, then verify the
+client login, picture, audio, HDR and RDP behavior from another machine.
+
+## License
+
+GPL v3. See `LICENSE`. The embedded Microsoft copyright header and the Easy-GPU-PV
+attribution must be preserved.
